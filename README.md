@@ -8,15 +8,29 @@ official [Proton Drive CLI](https://github.com/ProtonDriveApps/sdk/blob/main/cli
 - Open text files and images inside the app (read-only, with select and copy;
   images zoom and pan).
 - Open everything else in the desktop's default application.
-- Sign in through the browser and log out from the app.
+- List or grid view, remembered between runs.
+- Sign in through the browser; the preferences show the account and the CLI in
+  use, set the CLI's path and log out.
+- No thumbnails: the CLI cannot fetch the ones Proton stores, so files show
+  their type's icon.
 
 ## Requirements
 
 Install `proton-drive` from <https://proton.me/download/drive/cli> and put it
-on your `PATH`, or set `COLD_PASS_DRIVE_CLI` to where it is.
+on your `PATH`, or set its path in the preferences. `COLD_PASS_DRIVE_CLI`
+overrides both.
 
 ```sh
 cargo run --release
+```
+
+## Logging
+
+Logs go to stderr: every CLI call with its duration, and failures with what
+the CLI said. `RUST_LOG` sets the level, `info` for Cold Pass by default:
+
+```sh
+RUST_LOG=cold_pass=debug cargo run
 ```
 
 ## How it works

@@ -7,8 +7,9 @@
 //! the trash — without walking the tree by name.
 
 use std::ffi::OsString;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::time::Instant;
 
 use iced::futures::{SinkExt, Stream};
 use serde::Deserialize;
@@ -27,6 +28,25 @@ const AUTH_REQUIRED: &str = "You need to login first";
 #[derive(Debug, Clone)]
 pub struct Cli {
     program: PathBuf,
+    source: Source,
+}
+
+/// Where the CLI in use was found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Source {
+    /// [`CLI_ENV`].
+    Environment,
+    Settings,
+    Path,
+}
+
+/// The signed-in account, as far as the CLI tells.
+#[derive(Debug, Clone)]
+pub struct Account {
+    pub email: Option<String>,
+    /// Bytes in My Files, trashed ones included.
+    pub used: u64,
+    pub items: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -97,26 +117,98 @@ pub enum Login {
 }
 
 impl Cli {
-    /// Finds the CLI: [`CLI_ENV`] if set, else the first of [`CLI_NAMES`] on
-    /// `PATH` or in `~/.local/bin`.
-    pub fn locate() -> Option<Self> {
+    /// Finds the CLI: [`CLI_ENV`] if set, else `configured` if it is a
+    /// file, else the first of [`CLI_NAMES`] on `PATH` or in `~/.local/bin`.
+    pub fn locate(configured: Option<&Path>) -> Option<Self> {
         if let Some(program) = std::env::var_os(CLI_ENV).filter(|value| !value.is_empty()) {
-            return Some(Self {
-                program: program.into(),
-            });
+            return Some(Self::found(program.into(), Source::Environment));
+        }
+
+        if let Some(program) = configured {
+            if program.is_file() {
+                return Some(Self::found(program.to_owned(), Source::Settings));
+            }
+            tracing::warn!(path = %program.display(), "the CLI set in the settings is not a file");
         }
 
         let mut dirs: Vec<PathBuf> = std::env::var_os("PATH")
             .map(|path| std::env::split_paths(&path).collect())
             .unwrap_or_default();
-        if let Some(home) = std::env::var_os("HOME") {
-            dirs.push(PathBuf::from(home).join(".local/bin"));
-        }
+        dirs.extend(dirs::executable_dir());
 
-        dirs.iter()
+        let found = dirs
+            .iter()
             .flat_map(|dir| CLI_NAMES.iter().map(move |name| dir.join(executable(name))))
             .find(|candidate| candidate.is_file())
-            .map(|program| Self { program })
+            .map(|program| Self::found(program, Source::Path));
+
+        if found.is_none() {
+            tracing::warn!("no Proton Drive CLI on PATH");
+        }
+        found
+    }
+
+    fn found(program: PathBuf, source: Source) -> Self {
+        tracing::info!(program = %program.display(), ?source, "using the Proton Drive CLI");
+        Self { program, source }
+    }
+
+    pub fn program(&self) -> &Path {
+        &self.program
+    }
+
+    pub fn source(&self) -> Source {
+        self.source
+    }
+
+    /// The CLI's and its SDK's versions, as `version` prints them.
+    pub async fn version(self) -> Result<String, Error> {
+        let stdout = self.run(["version"]).await?;
+        let versions: Vec<&str> = stdout
+            .lines()
+            .filter_map(|line| line.strip_prefix("Proton Drive "))
+            .collect();
+
+        if versions.is_empty() {
+            Err(Error::Parse(stdout.trim().to_owned()))
+        } else {
+            Ok(versions.join(", "))
+        }
+    }
+
+    /// Who the session belongs to and how much My Files holds: the owner of
+    /// its root folder, and that folder's size.
+    pub async fn account(self) -> Result<Account, Error> {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Root {
+            owned_by: Owner,
+        }
+
+        #[derive(Deserialize)]
+        struct Owner {
+            email: Option<String>,
+        }
+
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Size {
+            size: u64,
+            number_of_descendants: u64,
+        }
+
+        let (root, size) = tokio::join!(
+            self.run(["filesystem", "info", "--json", "/my-files"]),
+            self.run(["filesystem", "size", "--json", "/my-files"]),
+        );
+        let root: Root = parse_json(&root?)?;
+        let size: Size = parse_json(&size?)?;
+
+        Ok(Account {
+            email: root.owned_by.email,
+            used: size.size,
+            items: size.number_of_descendants,
+        })
     }
 
     /// The contents of a folder, or of a section root such as `/devices`.
@@ -171,6 +263,7 @@ impl Cli {
     /// stream kills the CLI.
     pub fn login(self) -> impl Stream<Item = Login> {
         iced::stream::channel(4, async move |mut output| {
+            tracing::info!(program = %self.program.display(), "signing in");
             let result = async {
                 let mut child = self
                     .command(["auth", "login", "--json"])
@@ -196,6 +289,9 @@ impl Cli {
                     }
 
                     if let Ok(SignIn { sign_in_url }) = serde_json::from_str(line.trim()) {
+                        // The address carries a one-off sign-in token, so
+                        // it is not logged.
+                        tracing::info!("sign-in page ready");
                         let _ = output.send(Login::Url(sign_in_url)).await;
                     }
                 }
@@ -211,6 +307,10 @@ impl Cli {
             }
             .await;
 
+            match &result {
+                Ok(()) => tracing::info!("signed in"),
+                Err(error) => tracing::warn!(%error, "sign-in failed"),
+            }
             let _ = output.send(Login::Done(result)).await;
         })
     }
@@ -230,19 +330,51 @@ impl Cli {
         I: IntoIterator<Item = S>,
         S: AsRef<std::ffi::OsStr>,
     {
-        let output = self.command(args).output().await?;
+        let mut command = self.command(args);
+        let line = describe(&command);
+        tracing::debug!(command = %line, "running");
+
+        let started = Instant::now();
+        let output = command.output().await.inspect_err(|error| {
+            tracing::error!(command = %line, %error, "could not run the CLI");
+        })?;
+        let elapsed = started.elapsed();
         let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+        let stderr = String::from_utf8_lossy(&output.stderr);
 
         if output.status.success() {
+            tracing::info!(command = %line, ?elapsed, bytes = stdout.len(), "done");
+            if !stderr.trim().is_empty() {
+                tracing::debug!(command = %line, stderr = %stderr.trim(), "the CLI said");
+            }
             Ok(stdout)
         } else {
-            let mut said = String::from_utf8_lossy(&output.stderr).into_owned();
-            if said.trim().is_empty() {
-                said = stdout;
-            }
-            Err(failure(&said, output.status))
+            let said = if stderr.trim().is_empty() {
+                &stdout
+            } else {
+                &*stderr
+            };
+            tracing::warn!(
+                command = %line,
+                ?elapsed,
+                status = %output.status,
+                output = %said.trim(),
+                "failed",
+            );
+            Err(failure(said, output.status))
         }
     }
+}
+
+/// `command` as a shell would show it, for the log.
+fn describe(command: &Command) -> String {
+    let command = command.as_std();
+
+    std::iter::once(command.get_program())
+        .chain(command.get_args())
+        .map(|part| part.to_string_lossy())
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// `name` as an executable file is named on this platform.

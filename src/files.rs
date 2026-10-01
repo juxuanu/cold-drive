@@ -158,46 +158,32 @@ const TEXT_EXTENSIONS: &[&str] = &[
 
 /// Where a downloaded copy of `entry` is kept: one directory per revision,
 /// so a file opened twice is downloaded once, and a new version afresh.
+///
+/// The directory is named by a hash: a revision's UID joins three IDs of up
+/// to 108 characters each, past what a file name may be.
 pub fn cache_dir(entry: &Entry) -> PathBuf {
-    let key = entry.revision.as_deref().unwrap_or(&entry.uid);
-    let key: String = key
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '-' {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect();
+    let revision = entry.revision.as_deref().unwrap_or_default();
 
-    cache_dir_root().join(key)
+    cache_dir_root().join(format!(
+        "{:016x}{:016x}",
+        fnv1a(&entry.uid),
+        fnv1a(revision)
+    ))
 }
 
 /// Where every downloaded copy is kept.
 pub fn cache_dir_root() -> PathBuf {
-    cache_root().join("files")
+    dirs::cache_dir()
+        .unwrap_or_else(std::env::temp_dir)
+        .join("cold-pass")
+        .join("files")
 }
 
-fn cache_root() -> PathBuf {
-    if let Some(dir) = std::env::var_os("XDG_CACHE_HOME").filter(|dir| !dir.is_empty()) {
-        return PathBuf::from(dir).join("cold-pass");
-    }
-    if cfg!(windows)
-        && let Some(dir) = std::env::var_os("LOCALAPPDATA")
-    {
-        return PathBuf::from(dir).join("cold-pass").join("cache");
-    }
-    if let Some(home) = std::env::var_os("HOME") {
-        let home = PathBuf::from(home);
-        return if cfg!(target_os = "macos") {
-            home.join("Library/Caches/cold-pass")
-        } else {
-            home.join(".cache/cold-pass")
-        };
-    }
-
-    std::env::temp_dir().join("cold-pass")
+/// 64-bit FNV-1a: stable across builds, unlike `std`'s hasher.
+fn fnv1a(text: &str) -> u64 {
+    text.bytes().fold(0xcbf2_9ce4_8422_2325, |hash, byte| {
+        (hash ^ u64::from(byte)).wrapping_mul(0x0100_0000_01b3)
+    })
 }
 
 /// The file already downloaded into `dir`, if there is one.
@@ -350,7 +336,15 @@ mod tests {
 
     #[test]
     fn cache_dirs_are_keyed_by_revision() {
-        let dir = cache_dir(&file("a.txt", None));
-        assert!(dir.ends_with("files/rev_1"));
+        let long = "A".repeat(108);
+        let mut entry = file("a.txt", None);
+        entry.revision = Some(format!("{long}~{long}~{long}"));
+        let first = cache_dir(&entry);
+
+        entry.revision = Some("rev~2".into());
+        let second = cache_dir(&entry);
+
+        assert_ne!(first, second);
+        assert_eq!(first.file_name().unwrap().len(), 32);
     }
 }

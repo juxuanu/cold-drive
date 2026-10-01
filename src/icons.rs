@@ -34,6 +34,8 @@ icons! {
     user_trash => "user-trash",
     computer => "computer",
     view_refresh => "view-refresh",
+    view_grid => "view-grid",
+    view_list => "view-list",
     edit_copy => "edit-copy",
     network_offline => "network-offline",
 }

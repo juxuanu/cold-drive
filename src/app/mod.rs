@@ -5,30 +5,43 @@ use std::path::PathBuf;
 
 use iced::keyboard::{self, Key, key::Named};
 use iced::theme::Mode;
-use iced::widget::{center, column, container, image, row, svg, text_editor};
+use iced::widget::grid::Sizing;
+use iced::widget::{center, column, container, grid, image, row, svg, text, text_editor};
 use iced::{Alignment, Fill, Font, Subscription, Task};
+use libadwaita_iced::widget::about_dialog::Page as AboutPage;
 use libadwaita_iced::widget::breakpoint_bin::{self, breakpoint_bin};
 use libadwaita_iced::widget::navigation_view::NavigationPage;
 use libadwaita_iced::widget::popover_menu::{item, menu_button, separator};
 use libadwaita_iced::widget::sidebar::{self, Mode as SidebarMode};
 use libadwaita_iced::widget::toast::{self, Toasts};
 use libadwaita_iced::widget::{
-    action_row, boxed_list, clamp, header_bar, icon, navigation_page, navigation_split_view,
-    navigation_view, search_entry, spinner, status_page, toast_overlay, toolbar_view, window_title,
+    action_row, boxed_list, clamp, dialog, header_bar, icon, navigation_page,
+    navigation_split_view, navigation_view, search_entry, spinner, status_page, toast_overlay,
+    toolbar_view, window_title,
 };
 use libadwaita_iced::{
     AccentColor, Adwaita, ColorScheme, Contrast, Element, Widget, icons, typography, widget as adw,
     window,
 };
 
-use crate::drive::{self, Cli, Entry, Kind, Login};
+use crate::config::{Config, View};
+use crate::drive::{self, Account, Cli, Entry, Kind, Login};
 use crate::files::{self, Class, Content, Opened};
 use crate::{format, icons as more_icons};
+
+mod dialogs;
+
+/// A grid cell's widest; the columns are as many as fit.
+const TILE_WIDTH: f32 = 128.0;
+
+/// Width over height of a grid cell: the icon over two lines of name.
+const TILE_ASPECT_RATIO: f32 = 0.95;
 
 /// Where the CLI is to be had.
 const CLI_DOWNLOAD: &str = "https://proton.me/download/drive/cli/index.html";
 
 pub struct App {
+    config: Config,
     cli: Option<Cli>,
     section: Section,
     /// Collapsed, whether the content is up rather than the sidebar.
@@ -44,6 +57,22 @@ pub struct App {
     scheme: ColorScheme,
     focused: bool,
     maximized: bool,
+    /// The dialog presented, while it is up or still closing.
+    dialog: Option<Dialog>,
+    /// Whether the dialog is up; `false` while it animates away.
+    dialog_open: bool,
+    /// The preferences' CLI path entry, until applied.
+    cli_path_input: String,
+    /// `None` while being asked.
+    cli_version: Option<Result<String, String>>,
+    account: Option<Result<Account, String>>,
+    about_pages: Vec<AboutPage>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Dialog {
+    Preferences,
+    About,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -127,10 +156,22 @@ pub enum Message {
     SignIn,
     Login(Login),
     CancelSignIn,
-    CopyLink(String),
-    LinkCopied,
+    CopyText(String),
+    Copied,
     LogOut,
     LoggedOut(Result<(), drive::Error>),
+
+    ToggleView,
+    SettingsSaved(Result<(), String>),
+    ShowDialog(Dialog),
+    CloseDialog,
+    DialogClosed,
+    CliPathInput(String),
+    ApplyCliPath,
+    CliVersion(Result<String, drive::Error>),
+    AccountLoaded(Result<Account, drive::Error>),
+    AboutPush(AboutPage),
+    AboutPop,
 }
 
 impl App {
@@ -138,8 +179,15 @@ impl App {
         // Decrypted copies are kept for one session only.
         let _ = std::fs::remove_dir_all(files::cache_dir_root());
 
+        let config = Config::load();
         let mut app = Self {
-            cli: Cli::locate(),
+            cli: Cli::locate(config.cli_path.as_deref()),
+            cli_path_input: config
+                .cli_path
+                .as_deref()
+                .map(|path| path.display().to_string())
+                .unwrap_or_default(),
+            config,
             section: Section::MyFiles,
             show_content: false,
             pages: Vec::new(),
@@ -150,6 +198,11 @@ impl App {
             scheme: ColorScheme::Light,
             focused: true,
             maximized: false,
+            dialog: None,
+            dialog_open: false,
+            cli_version: None,
+            account: None,
+            about_pages: Vec::new(),
         };
 
         let load = app.open_section(Section::MyFiles);
@@ -172,6 +225,9 @@ impl App {
                 keyboard::Event::KeyPressed { key, modifiers, .. } => match key.as_ref() {
                     Key::Named(Named::F5) => Some(Message::RefreshTop),
                     Key::Character("r") if modifiers.command() => Some(Message::RefreshTop),
+                    Key::Character(",") if modifiers.command() => {
+                        Some(Message::ShowDialog(Dialog::Preferences))
+                    }
                     Key::Named(Named::ArrowLeft | Named::ArrowUp) if modifiers.alt() => {
                         Some(Message::Back)
                     }
@@ -212,7 +268,10 @@ impl App {
                             self.signed_out = true;
                             return Task::none();
                         }
-                        Err(error) => Listing::Failed(error.to_string()),
+                        Err(error) => {
+                            tracing::warn!(%error, "listing failed");
+                            Listing::Failed(error.to_string())
+                        }
                     };
                 }
             }
@@ -294,10 +353,10 @@ impl App {
                 }
             }
             Message::CancelSignIn => self.sign_in = None,
-            Message::CopyLink(url) => {
-                return iced::clipboard::write(url).map(|_| Message::LinkCopied);
+            Message::CopyText(text) => {
+                return iced::clipboard::write(text).map(|_| Message::Copied);
             }
-            Message::LinkCopied => self.toast("Link copied".into()),
+            Message::Copied => self.toast("Copied to clipboard".into()),
             Message::LogOut => {
                 if let Some(cli) = self.cli.clone() {
                     return Task::perform(cli.logout(), Message::LoggedOut);
@@ -305,12 +364,48 @@ impl App {
             }
             Message::LoggedOut(result) => match result {
                 Ok(()) | Err(drive::Error::AuthRequired) => {
+                    tracing::info!("logged out");
                     self.signed_out = true;
+                    self.account = None;
                     self.pages.clear();
+                    self.dialog_open = false;
                     let _ = std::fs::remove_dir_all(files::cache_dir_root());
                 }
                 Err(error) => self.toast(format!("Could not log out: {error}")),
             },
+
+            Message::ToggleView => {
+                self.config.view = self.config.view.toggled();
+                return self.save_settings();
+            }
+            Message::SettingsSaved(result) => {
+                if let Err(error) = result {
+                    self.toast(error);
+                }
+            }
+            Message::ShowDialog(which) => {
+                self.dialog = Some(which);
+                self.dialog_open = true;
+                self.about_pages.clear();
+                if which == Dialog::Preferences {
+                    return self.ask_about_cli();
+                }
+            }
+            Message::CloseDialog => self.dialog_open = false,
+            Message::DialogClosed => self.dialog = None,
+            Message::CliPathInput(path) => self.cli_path_input = path,
+            Message::ApplyCliPath => return self.apply_cli_path(),
+            Message::CliVersion(result) => {
+                self.cli_version = Some(result.map_err(|error| error.to_string()));
+            }
+            Message::AccountLoaded(result) => match result {
+                Err(drive::Error::AuthRequired) => self.account = None,
+                result => self.account = Some(result.map_err(|error| error.to_string())),
+            },
+            Message::AboutPush(page) => self.about_pages.push(page),
+            Message::AboutPop => {
+                self.about_pages.pop();
+            }
         }
 
         Task::none()
@@ -331,6 +426,11 @@ impl App {
         };
 
         let content = toast_overlay(content, &self.toasts).on_dismiss(Message::ToastDismissed);
+
+        let content = dialog(content, self.dialog.map(|which| self.dialog_view(which)))
+            .open(self.dialog_open)
+            .on_close(Message::CloseDialog)
+            .on_closed(Message::DialogClosed);
 
         adw::window(content)
             .on_window(Message::Window)
@@ -500,7 +600,56 @@ impl App {
     }
 
     fn toast(&mut self, title: String) {
+        tracing::info!(toast = %title);
         self.toasts.add(toast::toast(title));
+    }
+
+    fn save_settings(&self) -> Task<Message> {
+        Task::perform(self.config.clone().save(), Message::SettingsSaved)
+    }
+
+    /// Asks the CLI for its version and the account, for the preferences.
+    fn ask_about_cli(&mut self) -> Task<Message> {
+        self.cli_version = None;
+        self.account = None;
+
+        let Some(cli) = self.cli.clone() else {
+            return Task::none();
+        };
+        let version = Task::perform(cli.clone().version(), Message::CliVersion);
+        if self.signed_out {
+            return version;
+        }
+
+        Task::batch([
+            version,
+            Task::perform(cli.account(), Message::AccountLoaded),
+        ])
+    }
+
+    /// Takes the CLI path from the preferences: saved, and the CLI looked
+    /// for again.
+    fn apply_cli_path(&mut self) -> Task<Message> {
+        let input = self.cli_path_input.trim();
+        let path = (!input.is_empty()).then(|| PathBuf::from(input));
+
+        if let Some(path) = &path
+            && !path.is_file()
+        {
+            self.toast(format!("There is no file at {}", path.display()));
+            return Task::none();
+        }
+
+        self.config.cli_path = path;
+        self.cli = Cli::locate(self.config.cli_path.as_deref());
+        self.signed_out = false;
+        self.sign_in = None;
+
+        Task::batch([
+            self.save_settings(),
+            self.ask_about_cli(),
+            self.open_section(self.section),
+        ])
     }
 
     // ------------------------------------------------------------------ view
@@ -583,7 +732,12 @@ impl App {
                     .on_activate(Message::RefreshTop),
             )
             .push(separator())
-            .push(item("Log Out").on_activate(Message::LogOut))
+            .push(
+                item("Preferences")
+                    .accelerator("Ctrl+,")
+                    .on_activate(Message::ShowDialog(Dialog::Preferences)),
+            )
+            .push(item("About Cold Pass").on_activate(Message::ShowDialog(Dialog::About)))
             .boxed()
     }
 
@@ -622,24 +776,25 @@ impl App {
 
         let (title, view) = match &page.kind {
             PageKind::Folder(folder) => {
-                let subtitle = folder
-                    .trail
-                    .rsplit_once(" / ")
-                    .map(|(parent, _)| parent)
-                    .unwrap_or_default();
+                let parent = folder.trail.rsplit_once(" / ").map(|(parent, _)| parent);
+                let toggle = match self.config.view {
+                    View::List => more_icons::view_grid(),
+                    View::Grid => more_icons::view_list(),
+                };
                 let bar = self
                     .content_bar(
-                        window_title(&folder.title)
-                            .subtitle(subtitle)
-                            .backdrop(backdrop),
+                        page_title(&folder.title, parent, backdrop),
                         depth,
                         collapsed,
                     )
-                    .end(
+                    .end(row![
+                        adw::icon_button(toggle)
+                            .style(adw::button::flat)
+                            .on_press(Message::ToggleView),
                         adw::icon_button(more_icons::view_refresh())
                             .style(adw::button::flat)
                             .on_press(Message::Reload(page.tag.clone())),
-                    );
+                    ]);
 
                 (
                     folder.title.as_str(),
@@ -658,11 +813,10 @@ impl App {
                     subtitle.push(date);
                 }
 
+                let subtitle = subtitle.join(" · ");
                 let bar = self
                     .content_bar(
-                        window_title(&viewer.entry.name)
-                            .subtitle(subtitle.join(" · "))
-                            .backdrop(backdrop),
+                        page_title(&viewer.entry.name, Some(&subtitle), backdrop),
                         depth,
                         collapsed,
                     )
@@ -720,10 +874,9 @@ impl App {
         };
 
         let needle = folder.filter.to_lowercase();
-        let rows: Vec<_> = entries
+        let shown: Vec<&Entry> = entries
             .iter()
             .filter(|entry| needle.is_empty() || entry.name.to_lowercase().contains(&needle))
-            .map(|entry| self.row(tag, folder, entry))
             .collect();
 
         let search = search_entry("Search this folder", &folder.filter).on_input({
@@ -731,7 +884,7 @@ impl App {
             move |filter| Message::Filtered(tag.clone(), filter)
         });
 
-        let list: Element<'_, Message> = if rows.is_empty() {
+        let list: Element<'_, Message> = if shown.is_empty() {
             status_page()
                 .icon(icons::system_search())
                 .title("No Results Found")
@@ -739,7 +892,16 @@ impl App {
                 .compact(true)
                 .boxed()
         } else {
-            boxed_list().extend(rows).boxed()
+            match self.config.view {
+                View::List => boxed_list()
+                    .extend(shown.into_iter().map(|entry| self.row(tag, folder, entry)))
+                    .boxed(),
+                View::Grid => grid(shown.into_iter().map(|entry| self.tile(tag, folder, entry)))
+                    .fluid(TILE_WIDTH)
+                    .spacing(6)
+                    .height(Sizing::AspectRatio(TILE_ASPECT_RATIO))
+                    .boxed(),
+            }
         };
 
         adw::scrollable(
@@ -747,6 +909,38 @@ impl App {
                 .maximum_size(860)
                 .tightening_threshold(600),
         )
+        .boxed()
+    }
+
+    /// An entry in the grid: its icon large over its name, the whole a
+    /// flat button, as a Files icon view lays it out.
+    fn tile<'a>(&self, tag: &str, folder: &Folder, entry: &'a Entry) -> Element<'a, Message> {
+        let glyph: Element<'a, Message> = if folder.opening.as_deref() == Some(entry.uid.as_str()) {
+            spinner().size(32).boxed()
+        } else {
+            icon(entry_icon(entry)).size(48).boxed()
+        };
+
+        let name = typography::caption(entry.name.as_str())
+            .width(Fill)
+            .center()
+            .wrapping(text::Wrapping::WordOrGlyph)
+            .ellipsis(text::Ellipsis::End);
+
+        adw::button(
+            column![
+                center(glyph).height(64),
+                // Two lines of the name at most.
+                container(name).height(36).clip(true),
+            ]
+            .spacing(6)
+            .align_x(Alignment::Center),
+        )
+        .style(adw::button::flat)
+        .width(Fill)
+        .height(Fill)
+        .padding(6)
+        .on_press(Message::Activated(tag.to_owned(), entry.uid.clone()))
         .boxed()
     }
 
@@ -823,11 +1017,12 @@ impl App {
     }
 
     fn missing_cli(&self) -> Element<'_, Message> {
-        let description = format!(
-            "Cold Pass browses Proton Drive through its command-line client. Install it, put
-             proton-drive on your PATH or point {} at it, and start Cold Pass again.",
-            drive::CLI_ENV,
-        );
+        let mut description = "Cold Pass browses Proton Drive through its command-line client. \
+                               Install it and put proton-drive on your PATH, or set its path."
+            .to_owned();
+        if std::env::var_os(drive::CLI_ENV).is_some_and(|value| !value.is_empty()) {
+            description.push_str(&format!(" {} points at no file.", drive::CLI_ENV));
+        }
 
         self.lone_page(
             status_page()
@@ -835,9 +1030,15 @@ impl App {
                 .title("Proton Drive CLI Not Found")
                 .description(description)
                 .child(
-                    adw::pill_button("Get the CLI")
-                        .style(adw::button::suggested_pill)
-                        .on_press(Message::OpenExternally(CLI_DOWNLOAD.into())),
+                    column![
+                        adw::pill_button("Get the CLI")
+                            .style(adw::button::suggested_pill)
+                            .on_press(Message::OpenExternally(CLI_DOWNLOAD.into())),
+                        adw::pill_button("Set Its Path")
+                            .on_press(Message::ShowDialog(Dialog::Preferences)),
+                    ]
+                    .spacing(12)
+                    .align_x(Alignment::Center),
                 ),
         )
     }
@@ -872,7 +1073,7 @@ impl App {
                     adw::icon_text_button(icons::external_link(), "Open Browser")
                         .on_press(Message::OpenExternally(url.clone())),
                     adw::icon_text_button(more_icons::edit_copy(), "Copy Link")
-                        .on_press(Message::CopyLink(url.clone())),
+                        .on_press(Message::CopyText(url.clone())),
                 ]
                 .spacing(12)
                 .boxed(),
@@ -925,6 +1126,21 @@ async fn open(cli: Cli, entry: Entry) -> Result<Opened, drive::Error> {
     };
 
     files::load(file, files::classify(&entry)).await
+}
+
+/// A page's title, over a subtitle only when there is one: an empty
+/// subtitle still takes its line, and lifts the title off centre.
+fn page_title<'a>(
+    title: &'a str,
+    subtitle: Option<&str>,
+    backdrop: bool,
+) -> adw::window_title::WindowTitle<'a, Message> {
+    let title = window_title(title).backdrop(backdrop);
+
+    match subtitle.filter(|subtitle| !subtitle.is_empty()) {
+        Some(subtitle) => title.subtitle(subtitle.to_owned()),
+        None => title,
+    }
 }
 
 fn entry_icon(entry: &Entry) -> svg::Handle {
