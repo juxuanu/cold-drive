@@ -44,8 +44,14 @@ pub enum Source {
 #[derive(Debug, Clone)]
 pub struct Account {
     pub email: Option<String>,
-    /// Bytes in My Files, trashed ones included.
-    pub used: u64,
+    /// What My Files holds; `None` from a CLI without `filesystem size`.
+    pub usage: Option<Usage>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct Usage {
+    /// Bytes, trashed ones included.
+    pub bytes: u64,
     pub items: u64,
 }
 
@@ -164,16 +170,8 @@ impl Cli {
     /// The CLI's and its SDK's versions, as `version` prints them.
     pub async fn version(self) -> Result<String, Error> {
         let stdout = self.run(["version"]).await?;
-        let versions: Vec<&str> = stdout
-            .lines()
-            .filter_map(|line| line.strip_prefix("Proton Drive "))
-            .collect();
 
-        if versions.is_empty() {
-            Err(Error::Parse(stdout.trim().to_owned()))
-        } else {
-            Ok(versions.join(", "))
-        }
+        versions(&stdout).ok_or_else(|| Error::Parse(stdout.trim().to_owned()))
     }
 
     /// Who the session belongs to and how much My Files holds: the owner of
@@ -202,12 +200,23 @@ impl Cli {
             self.run(["filesystem", "size", "--json", "/my-files"]),
         );
         let root: Root = parse_json(&root?)?;
-        let size: Size = parse_json(&size?)?;
+
+        // `filesystem size` is newer than some CLIs in use; the account is
+        // shown without it.
+        let usage = match size.and_then(|stdout| parse_json::<Size>(&stdout)) {
+            Ok(size) => Some(Usage {
+                bytes: size.size,
+                items: size.number_of_descendants,
+            }),
+            Err(error) => {
+                tracing::info!(%error, "no size for My Files");
+                None
+            }
+        };
 
         Ok(Account {
             email: root.owned_by.email,
-            used: size.size,
-            items: size.number_of_descendants,
+            usage,
         })
     }
 
@@ -366,6 +375,26 @@ impl Cli {
     }
 }
 
+/// The versions in what `version` prints, as "CLI 0.8.0, SDK 0.21.0": each
+/// line's `Proton Drive <part> <build>`, with the build's name before `@`
+/// and its commit after `+` left out.
+fn versions(stdout: &str) -> Option<String> {
+    let versions: Vec<String> = stdout
+        .lines()
+        .filter_map(|line| line.trim().strip_prefix("Proton Drive "))
+        .filter_map(|line| {
+            let (part, build) = line.split_once(' ')?;
+            let version = build.rsplit_once('@').map_or(build, |(_, version)| version);
+            let version = version
+                .split_once('+')
+                .map_or(version, |(version, _)| version);
+            Some(format!("{part} {version}"))
+        })
+        .collect();
+
+    (!versions.is_empty()).then(|| versions.join(", "))
+}
+
 /// `command` as a shell would show it, for the log.
 fn describe(command: &Command) -> String {
     let command = command.as_std();
@@ -444,8 +473,32 @@ struct Node {
     #[serde(default)]
     is_shared: bool,
     modification_time: Option<String>,
-    active_revision: Option<Revision>,
+    active_revision: Option<ActiveRevision>,
     folder: Option<Folder>,
+}
+
+/// CLIs before 0.7 wrap the active revision in a `Result`, as `{"ok": true,
+/// "value": …}`; later ones give it bare.
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum ActiveRevision {
+    /// `ok` is what tells the wrapper from a bare revision; `value` is
+    /// absent when it is `false`.
+    Wrapped {
+        #[serde(rename = "ok")]
+        _ok: bool,
+        value: Option<Revision>,
+    },
+    Bare(Revision),
+}
+
+impl ActiveRevision {
+    fn into_revision(self) -> Option<Revision> {
+        match self {
+            ActiveRevision::Wrapped { value, .. } => value,
+            ActiveRevision::Bare(revision) => Some(revision),
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -500,14 +553,15 @@ fn entry(item: serde_json::Value, parent: &str) -> Option<Entry> {
         _ => Kind::File,
     };
 
-    let (size, revision, claimed) = match node.active_revision {
-        Some(revision) => (
-            revision.claimed_size,
-            Some(revision.uid),
-            revision.claimed_modification_time,
-        ),
-        None => (None, None, None),
-    };
+    let (size, revision, claimed) =
+        match node.active_revision.and_then(ActiveRevision::into_revision) {
+            Some(revision) => (
+                revision.claimed_size,
+                Some(revision.uid),
+                revision.claimed_modification_time,
+            ),
+            None => (None, None, None),
+        };
     let claimed = claimed.or(node
         .folder
         .and_then(|folder| folder.claimed_modification_time));
@@ -593,6 +647,20 @@ mod tests {
     }
 
     #[test]
+    fn revisions_wrapped_by_older_clis_are_unwrapped() {
+        let item = serde_json::json!({
+            "uid": UID,
+            "name": {"ok": true, "value": "old.txt"},
+            "type": "file",
+            "activeRevision": {"ok": true, "value": {"uid": "rev", "claimedSize": 7}},
+        });
+        let entry = entry(item, "/my-files").unwrap();
+
+        assert_eq!(entry.size, Some(7));
+        assert_eq!(entry.revision.as_deref(), Some("rev"));
+    }
+
+    #[test]
     fn devices_list_as_their_root_folders() {
         let json = format!(
             r#"[{{"uid":"dev","type":"Linux","name":{{"ok":true,"value":"Laptop"}},"rootFolderUid":"{UID}","creationTime":"2026-01-01T00:00:00.000Z","shareId":"s"}}]"#
@@ -635,6 +703,20 @@ mod tests {
             failure("=====\nValidationError: Node not found: x\n    at foo", status),
             Error::Failed(message) if message == "ValidationError: Node not found: x"
         ));
+    }
+
+    #[test]
+    fn versions_are_read_from_what_version_prints() {
+        let stdout = "Proton Drive CLI cli-drive@0.8.0+06e8c605\n\
+                      Proton Drive SDK js@0.21.0+06e8c605\n\
+                      You are running the latest version.\n";
+
+        assert_eq!(versions(stdout).as_deref(), Some("CLI 0.8.0, SDK 0.21.0"));
+        assert_eq!(
+            versions("Proton Drive CLI 0.4.1").as_deref(),
+            Some("CLI 0.4.1")
+        );
+        assert_eq!(versions("unexpected"), None);
     }
 
     #[test]

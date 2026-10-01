@@ -96,7 +96,7 @@ impl App {
             ));
         }
 
-        match &self.account {
+        let group = match &self.account {
             None => group.push(action_row("Email").suffix(spinner())),
             Some(Err(error)) => group.push(info_row("Could Not Read the Account", error.clone())),
             Some(Ok(account)) => group
@@ -107,20 +107,24 @@ impl App {
                         .clone()
                         .unwrap_or_else(|| "Unknown".to_owned()),
                 ))
-                .push(info_row(
-                    "My Files",
-                    format!(
-                        "{} in {} items, trash included",
-                        format::size(account.used),
-                        account.items
-                    ),
-                ))
-                .push(
-                    button_row("Log Out")
-                        .destructive()
-                        .on_activate(Message::LogOut),
-                ),
-        }
+                .extend(account.usage.map(|usage| {
+                    info_row(
+                        "My Files",
+                        format!(
+                            "{} in {} items, trash included",
+                            format::size(usage.bytes),
+                            usage.items
+                        ),
+                    )
+                })),
+        };
+
+        // Whatever could be read of the account, the session can end.
+        group.push(
+            button_row("Log Out")
+                .destructive()
+                .on_activate(Message::LogOut),
+        )
     }
 
     fn about(&self) -> Element<'_, Message> {
