@@ -325,7 +325,8 @@ fn shortcuts() -> Element<'static, Message> {
             shortcuts_section("Files")
                 .item(shortcuts_item("Upload Files", "<Control>u"))
                 .item(shortcuts_item("New Folder", "<Control>n"))
-                .item(shortcuts_item("Refresh", "F5 <Control>r")),
+                .item(shortcuts_item("Refresh", "F5 <Control>r"))
+                .item(shortcuts_item("Clear the Selection", "Escape")),
         )
         .section(
             shortcuts_section("Navigation")

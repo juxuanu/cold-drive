@@ -240,6 +240,8 @@ pub enum Message {
     /// Where a secondary press landed, and the window's size.
     RightPressed(Point, Size),
     CloseMenu,
+    /// Escape, outside a dialog: whatever is up first goes.
+    Escape,
     Download(String),
     DownloadTo(String, Vec<String>, Option<PathBuf>),
     Downloaded(String, Result<Transfer, drive::Error>),
@@ -351,7 +353,7 @@ impl App {
                     Some(Message::ModifiersChanged(modifiers))
                 }
                 keyboard::Event::KeyPressed { key, modifiers, .. } => match key.as_ref() {
-                    Key::Named(Named::Escape) => Some(Message::CloseMenu),
+                    Key::Named(Named::Escape) => Some(Message::Escape),
                     Key::Named(Named::F5) => Some(Message::RefreshTop),
                     Key::Character("r") if modifiers.command() => Some(Message::RefreshTop),
                     Key::Character("u") if modifiers.command() => Some(Message::UploadHere),
@@ -476,6 +478,30 @@ impl App {
                 });
             }
             Message::CloseMenu => self.menu = None,
+            Message::Escape => {
+                // A dialog takes its own Escape.
+                if self.dialog.is_some() || self.menu.take().is_some() {
+                    return Task::none();
+                }
+
+                // Then the selection of the folder shown, as Files clears
+                // it; and only with nothing selected does it go back.
+                let selection = self.pages.iter_mut().rev().find(|page| !page.popped);
+                if let Some(Page {
+                    kind: PageKind::Folder(folder),
+                    ..
+                }) = selection
+                    && !folder.selected.is_empty()
+                {
+                    folder.selected.clear();
+                    folder.anchor = None;
+                    return Task::none();
+                }
+
+                if self.live_pages().count() > 1 {
+                    return self.update(Message::Back);
+                }
+            }
             Message::Download(tag) => {
                 self.menu = None;
                 let Some(folder) = self.folder_mut(&tag) else {
@@ -1284,7 +1310,10 @@ impl App {
                     .map(|page| page.tag.clone())
                     .collect::<Vec<_>>(),
             )
-            .on_pop(Message::Back);
+            .on_pop(Message::Back)
+            // Escape goes back only once there is no selection to clear,
+            // which `Message::Escape` decides.
+            .pop_on_escape(false);
 
         navigation_split_view(side, stack)
             .collapsed(collapsed)
