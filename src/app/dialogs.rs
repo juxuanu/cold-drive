@@ -1,6 +1,7 @@
 //! The preferences and about dialogs.
 
-use iced::widget::column;
+use iced::widget::{column, text};
+use iced::{Alignment, Fill};
 use libadwaita_iced::widget::about_dialog;
 use libadwaita_iced::widget::view_switcher::page;
 use libadwaita_iced::widget::{
@@ -8,12 +9,13 @@ use libadwaita_iced::widget::{
     spinner,
 };
 use libadwaita_iced::widget::{
-    alert_dialog, response, shortcuts_dialog, shortcuts_item, shortcuts_section,
+    alert_dialog, header_bar, icon, response, shortcuts_dialog, shortcuts_item, shortcuts_section,
+    toolbar_view, window_title,
 };
 use libadwaita_iced::{Element, Widget, icons, typography, widget as adw};
 
 use super::{App, Dialog, Message};
-use crate::drive::{self, Source};
+use crate::drive::{self, Kind, Source};
 use crate::format;
 
 /// The New Folder dialog's name entry, focused as the dialog opens.
@@ -28,6 +30,7 @@ impl App {
             Dialog::About => self.about(),
             Dialog::NewFolder => self.new_folder(),
             Dialog::Shortcuts => shortcuts(),
+            Dialog::Info => self.info(),
         }
     }
 
@@ -170,6 +173,87 @@ impl App {
                     .enabled(valid)
                     .default_response(),
             )
+            .boxed()
+    }
+
+    /// What there is to know of one item: its icon and name over the
+    /// rows of a properties dialog, the CLI's details filled in as they
+    /// come.
+    fn info(&self) -> Element<'_, Message> {
+        let Some(info) = &self.info else {
+            return iced::widget::space().boxed();
+        };
+        let entry = &info.entry;
+
+        let kind = match entry.kind {
+            Kind::Folder => "Folder".to_owned(),
+            Kind::Device => "Computer".to_owned(),
+            Kind::File => entry
+                .media_type
+                .clone()
+                .unwrap_or_else(|| "File".to_owned()),
+        };
+
+        let heading = column![
+            icon(super::entry_icon(entry)).size(64),
+            typography::title_4(entry.name.as_str())
+                .center()
+                .wrapping(text::Wrapping::WordOrGlyph),
+            typography::caption(kind.clone()).style(adw::text::dimmed),
+        ]
+        .spacing(6)
+        .align_x(Alignment::Center)
+        .width(Fill);
+
+        let mut rows = preferences_group()
+            .push(info_row("Type", kind))
+            .push(info_row("Location", info.location.clone()));
+
+        rows = match &info.details {
+            None => rows.push(action_row("Details").suffix(spinner())),
+            Some(Err(error)) => rows.push(info_row("Could Not Read the Details", error.clone())),
+            Some(Ok(details)) => {
+                let date = |when: &Option<String>| when.as_deref().and_then(format::full_date);
+                let shared = match (details.shared, details.shared_by_link) {
+                    (_, true) => "Yes, by link",
+                    (true, false) => "Yes",
+                    (false, false) => "No",
+                };
+
+                rows.extend(
+                    [
+                        // The exact count, once the size is rounded.
+                        details.size.map(|size| match size {
+                            0..1000 => ("Size", format::size(size)),
+                            _ => ("Size", format!("{} ({size} bytes)", format::size(size))),
+                        }),
+                        date(&details.modified).map(|date| ("Modified", date)),
+                        date(&details.created).map(|date| ("Created", date)),
+                        details.created_by.clone().map(|who| ("Created By", who)),
+                        details.owner.clone().map(|owner| ("Owner", owner)),
+                        Some(("Shared", shared.to_owned())),
+                        details
+                            .stored
+                            .map(|stored| ("Stored on Proton Drive", format::size(stored))),
+                        details.sha1.clone().map(|sha1| ("SHA-1", sha1)),
+                    ]
+                    .into_iter()
+                    .flatten()
+                    .map(|(title, value)| info_row(title, value)),
+                )
+            }
+        };
+
+        let page = adw::scrollable(column![heading, rows].spacing(24).padding([24, 18]));
+
+        toolbar_view(page)
+            .top(
+                header_bar()
+                    .title(window_title("Info"))
+                    .on_close(Message::CloseDialog),
+            )
+            .width(420)
+            .height(560)
             .boxed()
     }
 

@@ -281,7 +281,7 @@ impl Cli {
     /// Uploads `files` into the folder at `parent`. A file whose name is
     /// taken is uploaded under another, as "Keep Both" would; one whose
     /// content is already there is skipped by the CLI.
-    pub async fn upload(self, files: Vec<PathBuf>, parent: String) -> Result<Upload, Error> {
+    pub async fn upload(self, files: Vec<PathBuf>, parent: String) -> Result<Transfer, Error> {
         let mut args: Vec<OsString> = [
             "filesystem",
             "upload",
@@ -295,13 +295,48 @@ impl Cli {
         args.extend(files.into_iter().map(OsString::from));
         args.push(parent.into());
 
-        // The summary is printed whether or not every file made it; the
-        // exit status only says that one did not.
+        self.transfer(args).await
+    }
+
+    /// Downloads the nodes at `paths` into `dir`, folders with all they
+    /// hold. What is already there by the same name is kept, the download
+    /// taking another; Proton Docs and Sheets are skipped by the CLI.
+    pub async fn download_to(self, paths: Vec<String>, dir: PathBuf) -> Result<Transfer, Error> {
+        let mut args: Vec<OsString> = [
+            "filesystem",
+            "download",
+            "--json",
+            "--file-conflict-strategy",
+            "rename",
+            "--folder-conflict-strategy",
+            "rename",
+            "--",
+        ]
+        .map(OsString::from)
+        .into();
+        args.extend(paths.into_iter().map(OsString::from));
+        args.push(dir.into());
+
+        self.transfer(args).await
+    }
+
+    /// Runs a transfer and reads its summary — printed whether or not every
+    /// item made it, as the exit status only says that one did not.
+    async fn transfer(&self, args: Vec<OsString>) -> Result<Transfer, Error> {
         let (stdout, outcome) = self.execute(args).await?;
         match parse_json::<Summary>(&stdout) {
             Ok(summary) => Ok(summary.into()),
             Err(error) => outcome.and(Err(error)),
         }
+    }
+
+    /// Everything the CLI tells of the node at `path`.
+    pub async fn info(self, path: String) -> Result<Details, Error> {
+        let stdout = self
+            .run(["filesystem", "info", "--json", "--", &path])
+            .await?;
+
+        parse_json::<NodeInfo>(&stdout).map(Details::from)
     }
 
     pub async fn logout(self) -> Result<(), Error> {
@@ -493,14 +528,100 @@ fn parse_json<T: serde::de::DeserializeOwned>(stdout: &str) -> Result<T, Error> 
     serde_json::from_str(&stdout[start..]).map_err(|error| Error::Parse(error.to_string()))
 }
 
-/// How an upload went.
+/// How an upload or a download went.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct Upload {
-    pub uploaded: u64,
+pub struct Transfer {
+    pub transferred: u64,
     /// Files whose content was already there.
     pub skipped: u64,
     /// Each file that failed, with why when the CLI says.
     pub failures: Vec<(String, Option<String>)>,
+}
+
+/// A node's metadata, as the Info dialog shows it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Details {
+    pub media_type: Option<String>,
+    /// RFC 3339.
+    pub created: Option<String>,
+    pub modified: Option<String>,
+    /// Who made the node, as its key's signature says; `None` when it
+    /// cannot be verified.
+    pub created_by: Option<String>,
+    pub owner: Option<String>,
+    pub size: Option<u64>,
+    /// What every revision takes on the server, encrypted.
+    pub stored: Option<u64>,
+    pub shared: bool,
+    pub shared_by_link: bool,
+    pub sha1: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct NodeInfo {
+    media_type: Option<String>,
+    creation_time: Option<String>,
+    modification_time: Option<String>,
+    key_author: Option<serde_json::Value>,
+    #[serde(default)]
+    owned_by: Option<Owner>,
+    total_storage_size: Option<u64>,
+    #[serde(default)]
+    is_shared: bool,
+    #[serde(default)]
+    is_shared_by_url: bool,
+    active_revision: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Deserialize)]
+struct Owner {
+    email: Option<String>,
+}
+
+impl From<NodeInfo> for Details {
+    fn from(node: NodeInfo) -> Self {
+        // The revision, bare or, from CLIs before 0.7, in a `Result`.
+        let revision = node
+            .active_revision
+            .map(|revision| match revision.get("value") {
+                Some(value) if revision.get("ok").is_some() => value.clone(),
+                _ => revision,
+            });
+        let revision = revision.as_ref();
+
+        // `Result<string | AnonymousUser, …>`: an address when verified.
+        let created_by = node
+            .key_author
+            .as_ref()
+            .filter(|author| author.get("ok").and_then(|ok| ok.as_bool()) == Some(true))
+            .and_then(|author| author.get("value")?.as_str())
+            .map(str::to_owned);
+
+        let text = |value: Option<&serde_json::Value>| {
+            value.and_then(|value| value.as_str()).map(str::to_owned)
+        };
+
+        Details {
+            media_type: node.media_type,
+            created: node.creation_time,
+            modified: text(revision.and_then(|revision| revision.get("claimedModificationTime")))
+                .or(node.modification_time),
+            created_by,
+            owner: node.owned_by.and_then(|owner| owner.email),
+            size: revision
+                .and_then(|revision| revision.get("claimedSize"))
+                .and_then(|size| size.as_u64()),
+            stored: node.total_storage_size,
+            shared: node.is_shared,
+            shared_by_link: node.is_shared_by_url,
+            sha1: text(
+                revision
+                    .and_then(|revision| revision.get("claimedDigests"))
+                    .and_then(|digests| digests.get("sha1")),
+            ),
+        }
+    }
 }
 
 /// What a transfer prints with `--json` once it is over.
@@ -521,7 +642,7 @@ struct SummaryFailure {
     error: Option<serde_json::Value>,
 }
 
-impl From<Summary> for Upload {
+impl From<Summary> for Transfer {
     fn from(summary: Summary) -> Self {
         let failures = summary
             .failures
@@ -540,7 +661,7 @@ impl From<Summary> for Upload {
             .collect();
 
         Self {
-            uploaded: summary.transferred_items,
+            transferred: summary.transferred_items,
             skipped: summary.skipped_items,
             failures,
         }
@@ -832,10 +953,10 @@ mod tests {
         let current = r#"{"transferredItems":2,"transferredBytes":10,"skippedItems":1,"failedItems":1,"failures":[{"name":"a.txt","error":"ValidationError: Too big"}]}"#;
         let release = r#"{"transferredItems":0,"transferredBytes":0,"skippedItems":0,"failedItems":1,"failures":[{"name":"b.txt","nodeUid":"x","error":{}}]}"#;
 
-        let current: Upload = parse_json::<Summary>(current).unwrap().into();
-        let release: Upload = parse_json::<Summary>(release).unwrap().into();
+        let current: Transfer = parse_json::<Summary>(current).unwrap().into();
+        let release: Transfer = parse_json::<Summary>(release).unwrap().into();
 
-        assert_eq!(current.uploaded, 2);
+        assert_eq!(current.transferred, 2);
         assert_eq!(current.skipped, 1);
         assert_eq!(
             current.failures,
@@ -845,6 +966,32 @@ mod tests {
             )]
         );
         assert_eq!(release.failures, [("b.txt".to_owned(), None)]);
+    }
+
+    #[test]
+    fn node_info_is_read_into_details() {
+        let json = r#"{"uid":"x","name":{"ok":true,"value":"a.txt"},"type":"file","mediaType":"text/plain",
+            "keyAuthor":{"ok":true,"value":"ada@proton.me"},"ownedBy":{"email":"ada@proton.me"},
+            "creationTime":"2026-01-01T00:00:00.000Z","modificationTime":"2026-02-01T00:00:00.000Z",
+            "isShared":true,"isSharedByUrl":true,"totalStorageSize":2048,
+            "activeRevision":{"uid":"r","claimedSize":1000,"claimedDigests":{"sha1":"abc","sha1Verified":true}}}"#;
+        let details = Details::from(parse_json::<NodeInfo>(json).unwrap());
+
+        assert_eq!(details.created_by.as_deref(), Some("ada@proton.me"));
+        assert_eq!(details.size, Some(1000));
+        assert_eq!(details.stored, Some(2048));
+        assert_eq!(details.sha1.as_deref(), Some("abc"));
+        assert_eq!(
+            details.modified.as_deref(),
+            Some("2026-02-01T00:00:00.000Z")
+        );
+        assert!(details.shared_by_link);
+
+        // An author that cannot be verified is not named.
+        let json = r#"{"keyAuthor":{"ok":false,"error":{"claimedAuthor":"eve@x"}},"activeRevision":{"ok":true,"value":{"claimedSize":5}}}"#;
+        let details = Details::from(parse_json::<NodeInfo>(json).unwrap());
+        assert_eq!(details.created_by, None);
+        assert_eq!(details.size, Some(5));
     }
 
     #[test]

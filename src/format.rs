@@ -34,6 +34,16 @@ pub fn date(rfc3339: &str) -> Option<String> {
     Some(relative(when, Local::now()))
 }
 
+/// An RFC 3339 time in full, as a properties dialog gives it:
+/// "30 September 2026, 14:09".
+pub fn full_date(rfc3339: &str) -> Option<String> {
+    let when = DateTime::parse_from_rfc3339(rfc3339)
+        .ok()?
+        .with_timezone(&Local);
+
+    Some(when.format("%-d %B %Y, %H:%M").to_string())
+}
+
 fn relative(when: DateTime<Local>, now: DateTime<Local>) -> String {
     if when.date_naive() == now.date_naive() {
         when.format("%H:%M").to_string()
@@ -75,5 +85,6 @@ mod tests {
             "7 Mar 2024"
         );
         assert!(date("not a date").is_none());
+        assert!(full_date("not a date").is_none());
     }
 }

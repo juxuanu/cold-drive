@@ -6,10 +6,13 @@ use std::path::PathBuf;
 use iced::keyboard::{self, Key, key::Named};
 use iced::theme::Mode;
 use iced::widget::grid::Sizing;
-use iced::widget::{center, column, container, grid, image, row, svg, text, text_editor};
-use iced::{Alignment, Fill, Font, Subscription, Task};
+use iced::widget::{
+    center, column, container, grid, image, mouse_area, pin, row, space, stack, svg, text,
+    text_editor,
+};
+use iced::{Alignment, Fill, Font, Point, Size, Subscription, Task};
 use libadwaita_iced::widget::about_dialog::Page as AboutPage;
-use libadwaita_iced::widget::boxed_list::{ListRow, RowStyle};
+use libadwaita_iced::widget::boxed_list::ListRow;
 use libadwaita_iced::widget::breakpoint_bin::{self, breakpoint_bin};
 use libadwaita_iced::widget::navigation_view::NavigationPage;
 use libadwaita_iced::widget::popover_menu::{item, menu_button, separator};
@@ -21,17 +24,19 @@ use libadwaita_iced::widget::{
     toolbar_view, window_title,
 };
 use libadwaita_iced::{
-    AccentColor, Adwaita, ColorScheme, Contrast, Element, Widget, color, icons, metrics,
-    typography, widget as adw, window,
+    AccentColor, Adwaita, ColorScheme, Contrast, Element, Widget, icons, metrics, typography,
+    widget as adw, window,
 };
+use std::time::Instant;
 
 use crate::config::{Config, View};
-use crate::drive::{self, Account, Cli, Entry, Kind, Login, Upload};
+use crate::drive::{self, Account, Cli, Details, Entry, Kind, Login, Transfer};
 use crate::files::{self, Class, Content, Opened};
 use crate::format;
 
 mod dialogs;
-mod reveal;
+mod pointer;
+mod selection;
 
 /// A grid cell's widest; the columns are as many as fit.
 const TILE_WIDTH: f32 = 128.0;
@@ -39,11 +44,11 @@ const TILE_WIDTH: f32 = 128.0;
 /// Width over height of a grid cell: the icon over two lines of name.
 const TILE_ASPECT_RATIO: f32 = 0.95;
 
-/// Around a row's icon, the rest of the row, scrolled into view with it.
-const ROW_MARGIN: f32 = 24.0;
+/// Two presses this close on one item open it — GTK's `gtk-double-click-time`.
+const DOUBLE_CLICK: std::time::Duration = std::time::Duration::from_millis(400);
 
-/// Around a tile's icon, the rest of the tile: the name below it.
-const TILE_MARGIN: f32 = 56.0;
+/// The context menu's width.
+const MENU_WIDTH: f32 = 180.0;
 
 /// Where the CLI is to be had.
 const CLI_DOWNLOAD: &str = "https://proton.me/download/drive/cli/index.html";
@@ -76,6 +81,31 @@ pub struct App {
     account: Option<Result<Account, String>>,
     about_pages: Vec<AboutPage>,
     new_folder: Option<NewFolder>,
+    /// The keys held, for Ctrl- and Shift-clicks.
+    modifiers: keyboard::Modifiers,
+    /// The last press on an item, to tell a double click by.
+    last_click: Option<(String, String, Instant)>,
+    /// The item a secondary click landed on, until where it landed comes.
+    menu_target: Option<(String, String)>,
+    menu: Option<ContextMenu>,
+    info: Option<Info>,
+}
+
+/// The context menu of a folder's items, open at `position`.
+struct ContextMenu {
+    tag: String,
+    /// The item it was opened on; it acts on the selection, which holds it.
+    uid: String,
+    position: Point,
+}
+
+/// The item the Info dialog is about.
+struct Info {
+    entry: Entry,
+    /// Where it is: the trail of the folder it is in.
+    location: String,
+    /// `None` while the CLI is asked.
+    details: Option<Result<Details, String>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -84,6 +114,7 @@ pub enum Dialog {
     About,
     NewFolder,
     Shortcuts,
+    Info,
 }
 
 /// The folder being named in the New Folder dialog.
@@ -126,13 +157,38 @@ struct Folder {
     opening: Option<String>,
     /// Whether files and folders can be added here.
     writable: bool,
-    /// Uploads into the folder still running.
-    uploads: usize,
+    /// Uploads into the folder and downloads from it still running.
+    transfers: usize,
     /// Names to select once the folder is next listed: what was just
     /// created or uploaded into it.
-    reveal: Vec<String>,
-    /// The entries selected, by UID: shown highlighted.
+    select_next: Vec<String>,
+    /// The entries selected, by UID.
     selected: Vec<String>,
+    /// Where a Shift-click selects from: the last item clicked alone or
+    /// with Ctrl.
+    anchor: Option<String>,
+}
+
+impl Folder {
+    /// The entries shown, as the search leaves them.
+    fn shown(&self) -> Vec<&Entry> {
+        let Listing::Loaded(entries) = &self.listing else {
+            return Vec::new();
+        };
+        let needle = self.filter.to_lowercase();
+
+        entries
+            .iter()
+            .filter(|entry| needle.is_empty() || entry.name.to_lowercase().contains(&needle))
+            .collect()
+    }
+
+    fn entry(&self, uid: &str) -> Option<&Entry> {
+        match &self.listing {
+            Listing::Loaded(entries) => entries.iter().find(|entry| entry.uid == uid),
+            _ => None,
+        }
+    }
 }
 
 enum Listing {
@@ -174,7 +230,21 @@ pub enum Message {
     Filtered(String, String),
     Reload(String),
     RefreshTop,
-    Activated(String, String),
+    /// A press on an item: selects it, or opens it on a double click.
+    Clicked(String, String),
+    /// A press on a folder's empty space.
+    Deselect(String),
+    ModifiersChanged(keyboard::Modifiers),
+    /// A secondary press on an item, heard before where it landed.
+    ItemMenu(String, String),
+    /// Where a secondary press landed, and the window's size.
+    RightPressed(Point, Size),
+    CloseMenu,
+    Download(String),
+    DownloadTo(String, Vec<String>, Option<PathBuf>),
+    Downloaded(String, Result<Transfer, drive::Error>),
+    ShowInfo(String, String),
+    InfoLoaded(String, Result<Details, drive::Error>),
     Opened(String, String, Result<Opened, drive::Error>),
     OpenExternally(String),
     OpenedExternally(Result<(), String>),
@@ -206,7 +276,7 @@ pub enum Message {
     UploadHere,
     Picked(String, Vec<PathBuf>),
     /// The folder's page, the files' names.
-    Uploaded(String, Vec<String>, Result<Upload, drive::Error>),
+    Uploaded(String, Vec<String>, Result<Transfer, drive::Error>),
     NewFolderIn(String),
     NewFolderHere,
     NewFolderNamed(String),
@@ -244,6 +314,11 @@ impl App {
             account: None,
             about_pages: Vec::new(),
             new_folder: None,
+            modifiers: keyboard::Modifiers::default(),
+            last_click: None,
+            menu_target: None,
+            menu: None,
+            info: None,
         };
 
         let load = app.open_section(Section::MyFiles);
@@ -272,7 +347,11 @@ impl App {
                 } if character == "?" && modifiers.command() => {
                     Some(Message::ShowDialog(Dialog::Shortcuts))
                 }
+                keyboard::Event::ModifiersChanged(modifiers) => {
+                    Some(Message::ModifiersChanged(modifiers))
+                }
                 keyboard::Event::KeyPressed { key, modifiers, .. } => match key.as_ref() {
+                    Key::Named(Named::Escape) => Some(Message::CloseMenu),
                     Key::Named(Named::F5) => Some(Message::RefreshTop),
                     Key::Character("r") if modifiers.command() => Some(Message::RefreshTop),
                     Key::Character("u") if modifiers.command() => Some(Message::UploadHere),
@@ -296,7 +375,13 @@ impl App {
                 return window::perform(action)
                     .chain(window::is_maximized().map(Message::Maximized));
             }
-            Message::Focused(focused) => self.focused = focused,
+            Message::Focused(focused) => {
+                self.focused = focused;
+                // Keys let go of elsewhere are never heard of.
+                if !focused {
+                    self.modifiers = keyboard::Modifiers::default();
+                }
+            }
             Message::Maximized(maximized) => self.maximized = maximized,
             Message::Resized => return window::is_maximized().map(Message::Maximized),
             Message::SystemScheme(mode) => {
@@ -316,30 +401,18 @@ impl App {
                 if let Some(folder) = self.folder_mut(&tag) {
                     folder.listing = match result {
                         Ok(entries) => {
-                            let reveal = std::mem::take(&mut folder.reveal);
+                            let names = std::mem::take(&mut folder.select_next);
                             folder.selected = entries
                                 .iter()
-                                .filter(|entry| reveal.contains(&entry.name))
+                                .filter(|entry| names.contains(&entry.name))
                                 .map(|entry| entry.uid.clone())
                                 .collect();
-                            let first = folder.selected.first().cloned();
-                            if first.is_some() {
+                            folder.anchor = folder.selected.first().cloned();
+                            if !folder.selected.is_empty() {
                                 // What is selected must not be filtered out.
                                 folder.filter.clear();
                             }
-                            folder.listing = Listing::Loaded(entries);
-
-                            let view = self.config.view;
-                            return first.map_or_else(Task::none, |uid| {
-                                reveal::reveal(
-                                    scroll_id(&tag),
-                                    anchor_id(&tag, &uid),
-                                    match view {
-                                        View::List => ROW_MARGIN,
-                                        View::Grid => TILE_MARGIN,
-                                    },
-                                )
-                            });
+                            Listing::Loaded(entries)
                         }
                         Err(drive::Error::AuthRequired) => {
                             self.signed_out = true;
@@ -369,7 +442,116 @@ impl App {
                     return self.load(&tag);
                 }
             }
-            Message::Activated(tag, uid) => return self.activate(&tag, &uid),
+            Message::Clicked(tag, uid) => return self.click(&tag, &uid),
+            Message::Deselect(tag) => {
+                if let Some(folder) = self.folder_mut(&tag) {
+                    folder.selected.clear();
+                    folder.anchor = None;
+                }
+            }
+            Message::ModifiersChanged(modifiers) => self.modifiers = modifiers,
+            Message::ItemMenu(tag, uid) => {
+                // As in Files: a secondary click on an item outside the
+                // selection selects it alone; on one inside, keeps it.
+                if let Some(folder) = self.folder_mut(&tag)
+                    && !folder.selected.contains(&uid)
+                {
+                    folder.selected = vec![uid.clone()];
+                    folder.anchor = Some(uid.clone());
+                }
+                self.menu_target = Some((tag, uid));
+            }
+            Message::RightPressed(position, window) => {
+                self.menu = self.menu_target.take().map(|(tag, uid)| ContextMenu {
+                    tag,
+                    uid,
+                    position: menu_position(position, window),
+                });
+            }
+            Message::CloseMenu => self.menu = None,
+            Message::Download(tag) => {
+                self.menu = None;
+                let Some(folder) = self.folder_mut(&tag) else {
+                    return Task::none();
+                };
+                let paths: Vec<String> = folder
+                    .shown()
+                    .into_iter()
+                    .filter(|entry| folder.selected.contains(&entry.uid))
+                    .map(|entry| entry.path.clone())
+                    .collect();
+                if paths.is_empty() {
+                    return Task::none();
+                }
+
+                let mut chooser = rfd::AsyncFileDialog::new().set_title("Download To");
+                if let Some(downloads) = dirs::download_dir() {
+                    chooser = chooser.set_directory(downloads);
+                }
+                return Task::perform(chooser.pick_folder(), move |dir| {
+                    Message::DownloadTo(
+                        tag.clone(),
+                        paths.clone(),
+                        dir.map(|dir| dir.path().to_owned()),
+                    )
+                });
+            }
+            Message::DownloadTo(tag, paths, Some(dir)) => return self.download(&tag, paths, dir),
+            Message::DownloadTo(_, _, None) => {}
+            Message::Downloaded(tag, result) => {
+                if let Some(folder) = self.folder_mut(&tag) {
+                    folder.transfers = folder.transfers.saturating_sub(1);
+                }
+                match result {
+                    Ok(transfer) => {
+                        tracing::info!(
+                            downloaded = transfer.transferred,
+                            skipped = transfer.skipped,
+                            "download done"
+                        );
+                        if let Some(failure) = transfer_failure("download", &transfer) {
+                            self.toast(failure);
+                        }
+                    }
+                    Err(drive::Error::AuthRequired) => self.signed_out = true,
+                    Err(error) => self.toast(format!("Could not download: {error}")),
+                }
+            }
+            Message::ShowInfo(tag, uid) => {
+                self.menu = None;
+                let Some(cli) = self.cli.clone() else {
+                    return Task::none();
+                };
+                let Some(folder) = self.folder_mut(&tag) else {
+                    return Task::none();
+                };
+                let Some(entry) = folder.entry(&uid).cloned() else {
+                    return Task::none();
+                };
+
+                let path = entry.path.clone();
+                self.info = Some(Info {
+                    entry,
+                    location: folder.trail.clone(),
+                    details: None,
+                });
+                self.dialog = Some(Dialog::Info);
+                self.dialog_open = true;
+
+                return Task::perform(cli.info(path), move |result| {
+                    Message::InfoLoaded(uid.clone(), result)
+                });
+            }
+            Message::InfoLoaded(uid, result) => {
+                if let Some(info) = &mut self.info
+                    && info.entry.uid == uid
+                {
+                    if let Err(error) = &result {
+                        tracing::warn!(%error, "no info");
+                    }
+                    info.details = Some(result.map_err(|error| error.to_string()));
+                }
+            }
             Message::Opened(tag, uid, result) => return self.opened(&tag, &uid, result),
             Message::OpenExternally(target) => {
                 return Task::perform(files::open_externally(target), Message::OpenedExternally);
@@ -473,6 +655,7 @@ impl App {
             Message::DialogClosed => {
                 self.dialog = None;
                 self.new_folder = None;
+                self.info = None;
             }
             Message::CliPathInput(path) => self.cli_path_input = path,
             Message::ApplyCliPath => return self.apply_cli_path(),
@@ -536,7 +719,7 @@ impl App {
                 Ok(()) => {
                     tracing::info!(%name, "folder created");
                     if let Some(folder) = self.folder_mut(&tag) {
-                        folder.reveal = vec![name];
+                        folder.select_next = vec![name];
                     }
                     return self.load(&tag);
                 }
@@ -552,14 +735,32 @@ impl App {
         let content = match &self.cli {
             None => self.missing_cli(),
             Some(_) if self.signed_out => self.signed_out_page(),
-            Some(_) => breakpoint_bin(
-                [breakpoint_bin::breakpoint(
-                    breakpoint_bin::Condition::max_width(550.0, breakpoint_bin::Unit::Sp),
-                    (),
-                )],
-                |narrow| self.shell(narrow.is_some()),
-            )
-            .boxed(),
+            Some(_) => {
+                let shell = breakpoint_bin(
+                    [breakpoint_bin::breakpoint(
+                        breakpoint_bin::Condition::max_width(550.0, breakpoint_bin::Unit::Sp),
+                        (),
+                    )],
+                    |narrow| self.shell(narrow.is_some()),
+                )
+                .boxed();
+
+                // The context menu floats over the window at the pointer;
+                // a press anywhere else puts it away.
+                let shell = match &self.menu {
+                    Some(menu) => stack![
+                        shell,
+                        mouse_area(space().width(Fill).height(Fill))
+                            .on_press(Message::CloseMenu)
+                            .on_right_press(Message::CloseMenu),
+                        pin(self.context_menu(menu)).position(menu.position),
+                    ]
+                    .boxed(),
+                    None => shell,
+                };
+
+                pointer::pointer_area(shell, Message::RightPressed).boxed()
+            }
         };
 
         let content = toast_overlay(content, &self.toasts).on_dismiss(Message::ToastDismissed);
@@ -591,9 +792,10 @@ impl App {
             filter: String::new(),
             opening: None,
             writable: section == Section::MyFiles,
-            uploads: 0,
-            reveal: Vec::new(),
+            transfers: 0,
+            select_next: Vec::new(),
             selected: Vec::new(),
+            anchor: None,
         }));
 
         self.load(&tag)
@@ -641,8 +843,6 @@ impl App {
         let Some(entry) = entries.iter().find(|entry| entry.uid == uid).cloned() else {
             return Task::none();
         };
-        folder.selected.clear();
-
         if entry.is_folder() {
             let child = Folder {
                 trail: format!("{} / {}", folder.trail, entry.name),
@@ -654,9 +854,10 @@ impl App {
                 // Anything below a section's root is a folder, but what is
                 // in the trash stays as it is.
                 writable: self.section != Section::Trash,
-                uploads: 0,
-                reveal: Vec::new(),
+                transfers: 0,
+                select_next: Vec::new(),
                 selected: Vec::new(),
+                anchor: None,
             };
             let child = self.push(PageKind::Folder(child));
             return self.load(&child);
@@ -752,6 +953,74 @@ impl App {
         self.toasts.add(toast::toast(title));
     }
 
+    /// A press on an item: Ctrl adds it to the selection or takes it out,
+    /// Shift selects the run from the last item pressed, and otherwise it is
+    /// selected alone — or opened, pressed twice in a row.
+    fn click(&mut self, tag: &str, uid: &str) -> Task<Message> {
+        let now = Instant::now();
+        let (toggle, extend) = (self.modifiers.command(), self.modifiers.shift());
+
+        let double = !toggle
+            && !extend
+            && self
+                .last_click
+                .as_ref()
+                .is_some_and(|(last_tag, last_uid, at)| {
+                    last_tag == tag && last_uid == uid && now.duration_since(*at) <= DOUBLE_CLICK
+                });
+        self.last_click = (!double).then(|| (tag.to_owned(), uid.to_owned(), now));
+        if double {
+            return self.activate(tag, uid);
+        }
+
+        let Some(folder) = self.folder_mut(tag) else {
+            return Task::none();
+        };
+
+        if toggle {
+            if let Some(at) = folder.selected.iter().position(|selected| selected == uid) {
+                folder.selected.remove(at);
+            } else {
+                folder.selected.push(uid.to_owned());
+            }
+            folder.anchor = Some(uid.to_owned());
+        } else if let (true, Some(anchor)) = (extend, folder.anchor.clone()) {
+            let shown: Vec<String> = folder
+                .shown()
+                .iter()
+                .map(|entry| entry.uid.clone())
+                .collect();
+            let from = shown.iter().position(|shown| *shown == anchor);
+            let to = shown.iter().position(|shown| shown == uid);
+            if let (Some(from), Some(to)) = (from, to) {
+                folder.selected = shown[from.min(to)..=from.max(to)].to_vec();
+            }
+        } else {
+            folder.selected = vec![uid.to_owned()];
+            folder.anchor = Some(uid.to_owned());
+        }
+
+        Task::none()
+    }
+
+    fn download(&mut self, tag: &str, paths: Vec<String>, dir: PathBuf) -> Task<Message> {
+        let Some(cli) = self.cli.clone() else {
+            return Task::none();
+        };
+        let Some(folder) = self.folder_mut(tag) else {
+            return Task::none();
+        };
+
+        // The spinner in the header bar shows it is under way.
+        folder.transfers += 1;
+        tracing::info!(?paths, dir = %dir.display(), "downloading");
+
+        let tag = tag.to_owned();
+        Task::perform(cli.download_to(paths, dir), move |result| {
+            Message::Downloaded(tag.clone(), result)
+        })
+    }
+
     /// The folder on top of the stack, if files and folders can go in it.
     fn writable_top(&self) -> Option<String> {
         self.live_pages()
@@ -771,7 +1040,7 @@ impl App {
             return Task::none();
         };
 
-        folder.uploads += 1;
+        folder.transfers += 1;
         let parent = folder.path.clone();
         let names: Vec<String> = files
             .iter()
@@ -795,13 +1064,13 @@ impl App {
         &mut self,
         tag: &str,
         names: Vec<String>,
-        result: Result<Upload, drive::Error>,
+        result: Result<Transfer, drive::Error>,
     ) -> Task<Message> {
         if let Some(folder) = self.folder_mut(tag) {
-            folder.uploads = folder.uploads.saturating_sub(1);
+            folder.transfers = folder.transfers.saturating_sub(1);
             // What arrived, or was already there, is selected; only what
             // failed is told.
-            folder.reveal = names;
+            folder.select_next = names;
         }
 
         let upload = match result {
@@ -820,11 +1089,11 @@ impl App {
             tracing::warn!(%name, reason = reason.as_deref().unwrap_or("unknown"), "upload failed");
         }
         tracing::info!(
-            uploaded = upload.uploaded,
+            uploaded = upload.transferred,
             skipped = upload.skipped,
             "upload done"
         );
-        if let Some(failure) = upload_failure(&upload) {
+        if let Some(failure) = transfer_failure("upload", &upload) {
             self.toast(failure);
         }
 
@@ -1016,6 +1285,57 @@ impl App {
             .boxed()
     }
 
+    /// The items' context menu: a popover without its tail, as libadwaita's
+    /// context menus are, of `popover.menu` rows.
+    fn context_menu(&self, menu: &ContextMenu) -> Element<'_, Message> {
+        let item = |label: &'static str, message: Message| {
+            adw::button(
+                typography::label(label)
+                    .width(Fill)
+                    .height(Fill)
+                    .align_y(Alignment::Center),
+            )
+            .on_press(message)
+            .width(Fill)
+            .height(metrics::MENU_ITEM_MIN_HEIGHT)
+            .padding([0.0, metrics::MENU_ITEM_PADDING_X])
+            .style(|theme: &Adwaita, status| {
+                let menu = adw::menu::default(theme);
+                adw::button::Style {
+                    background: matches!(
+                        status,
+                        adw::button::Status::Hovered | adw::button::Status::Pressed
+                    )
+                    .then_some(menu.selected_background),
+                    text_color: menu.text_color,
+                    border: iced::border::rounded(metrics::radius::MENU),
+                    ..adw::button::Style::default()
+                }
+            })
+        };
+
+        container(column![
+            item("Download…", Message::Download(menu.tag.clone())),
+            item(
+                "Info",
+                Message::ShowInfo(menu.tag.clone(), menu.uid.clone())
+            ),
+        ])
+        .padding(metrics::MENU_MARGIN)
+        .width(MENU_WIDTH)
+        .style(|theme| {
+            let menu = adw::menu::default(theme);
+            container::Style {
+                background: Some(menu.background),
+                text_color: Some(menu.text_color),
+                border: menu.border.rounded(metrics::radius::POPOVER),
+                shadow: menu.shadow,
+                ..container::Style::default()
+            }
+        })
+        .boxed()
+    }
+
     fn main_menu(&self) -> Element<'_, Message> {
         menu_button(icon(icons::open_menu()))
             .style(adw::button::flat)
@@ -1082,7 +1402,7 @@ impl App {
                 };
                 // While an upload runs, the spinner stands where Refresh
                 // would: the listing is refreshed once it is done.
-                let refresh: Element<'_, Message> = if folder.uploads > 0 {
+                let refresh: Element<'_, Message> = if folder.transfers > 0 {
                     container(spinner())
                         .width(metrics::BUTTON_IMAGE_MIN_SIZE.width)
                         .height(metrics::BUTTON_IMAGE_MIN_SIZE.height)
@@ -1189,11 +1509,8 @@ impl App {
             Listing::Loaded(entries) => entries,
         };
 
-        let needle = folder.filter.to_lowercase();
-        let shown: Vec<&Entry> = entries
-            .iter()
-            .filter(|entry| needle.is_empty() || entry.name.to_lowercase().contains(&needle))
-            .collect();
+        let _ = entries;
+        let shown = folder.shown();
 
         let search = search_entry("Search this folder", &folder.filter).on_input({
             let tag = tag.to_owned();
@@ -1220,17 +1537,18 @@ impl App {
             }
         };
 
-        adw::scrollable(
+        // A press that no item takes is on the folder itself.
+        mouse_area(adw::scrollable(
             clamp(column![search, list].spacing(12).padding([24, 12]))
                 .maximum_size(860)
                 .tightening_threshold(600),
-        )
-        .id(scroll_id(tag))
+        ))
+        .on_press(Message::Deselect(tag.to_owned()))
         .boxed()
     }
 
-    /// An entry in the grid: its icon large over its name, the whole a
-    /// flat button, as a Files icon view lays it out.
+    /// An entry in the grid: its icon large over its name, as a Files icon
+    /// view lays it out — `gridview > child`.
     fn tile<'a>(&self, tag: &str, folder: &Folder, entry: &'a Entry) -> Element<'a, Message> {
         let glyph: Element<'a, Message> = if folder.opening.as_deref() == Some(entry.uid.as_str()) {
             spinner().size(32).boxed()
@@ -1246,34 +1564,29 @@ impl App {
 
         let selected = folder.selected.contains(&entry.uid);
 
-        adw::button(
+        let tile = adw::button(
             column![
-                center(glyph).height(64).id(anchor_id(tag, &entry.uid)),
+                center(glyph).height(64),
                 // Two lines of the name at most.
                 container(name).height(36).clip(true),
             ]
             .spacing(6)
             .align_x(Alignment::Center),
         )
-        .style(move |theme: &Adwaita, status| {
-            let style = adw::button::flat(theme, status);
-            if selected {
-                // A selected item in an icon view: washed in the accent.
-                adw::button::Style {
-                    background: Some(color::alpha(theme.colors().accent_bg, 0.25).into()),
-                    ..style
-                }
-            } else {
-                style
-            }
-        })
+        .style(move |theme, status| selection::tile(theme, status, selected))
         .width(Fill)
         .height(Fill)
         .padding(6)
-        .on_press(Message::Activated(tag.to_owned(), entry.uid.clone()))
-        .boxed()
+        .on_press(Message::Clicked(tag.to_owned(), entry.uid.clone()));
+
+        mouse_area(tile)
+            .on_right_press(Message::ItemMenu(tag.to_owned(), entry.uid.clone()))
+            .boxed()
     }
 
+    /// An entry in the list: the library's action row, pressed through a
+    /// button of our own so that it can be selected and take a secondary
+    /// click — the same button, padding and corners the row would have.
     fn row<'a>(&self, tag: &str, folder: &Folder, entry: &'a Entry) -> ListRow<'a, Message> {
         let mut details = Vec::new();
         if entry.kind == Kind::File
@@ -1288,15 +1601,10 @@ impl App {
             details.push("Shared".to_owned());
         }
 
-        // The icon as a prefix lays out as `.icon` would, and carries the
-        // id the row is scrolled into view by.
-        let mut row = action_row(entry.name.as_str())
-            .prefix(container(icon(entry_icon(entry))).id(anchor_id(tag, &entry.uid)))
-            .on_activate(Message::Activated(tag.to_owned(), entry.uid.clone()));
+        let mut row = action_row(entry.name.as_str()).icon(entry_icon(entry));
         if !details.is_empty() {
             row = row.subtitle(details.join(" · "));
         }
-
         let row = if folder.opening.as_deref() == Some(entry.uid.as_str()) {
             row.suffix(spinner())
         } else if entry.is_folder() {
@@ -1306,11 +1614,20 @@ impl App {
         };
 
         let selected = folder.selected.contains(&entry.uid);
-        ListRow::from(row).style(if selected {
-            RowStyle::Suggested
-        } else {
-            RowStyle::Plain
+        let on_press = Message::Clicked(tag.to_owned(), entry.uid.clone());
+        let on_menu = Message::ItemMenu(tag.to_owned(), entry.uid.clone());
+        let header = row.header();
+
+        ListRow::positioned(move |corners| {
+            adw::button(mouse_area(header).on_right_press(on_menu))
+                .on_press(on_press)
+                .padding(boxed_list::ROW_PADDING)
+                .min_size(Size::ZERO)
+                .width(Fill)
+                .style(move |theme, status| selection::row(theme, status, selected, corners))
+                .boxed()
         })
+        .padding(0.0)
     }
 
     fn viewer<'a>(&'a self, tag: &'a str, viewer: &'a Viewer) -> Element<'a, Message> {
@@ -1480,25 +1797,38 @@ fn add_menu(tag: &str) -> Element<'static, Message> {
         .boxed()
 }
 
-/// What an upload's toast says: what failed, if anything did.
-fn upload_failure(upload: &Upload) -> Option<String> {
-    match upload.failures.as_slice() {
+/// What a transfer's toast says: what failed, if anything did — `verb` the
+/// transfer, "upload" or "download".
+fn transfer_failure(verb: &str, transfer: &Transfer) -> Option<String> {
+    match transfer.failures.as_slice() {
         [] => None,
-        [(name, Some(reason))] => Some(format!("Could not upload “{name}”: {reason}")),
-        [(name, None)] => Some(format!("Could not upload “{name}”")),
-        failures => Some(format!("Could not upload {} files", failures.len())),
+        [(name, Some(reason))] => Some(format!("Could not {verb} “{name}”: {reason}")),
+        [(name, None)] => Some(format!("Could not {verb} “{name}”")),
+        failures => Some(format!("Could not {verb} {} items", failures.len())),
     }
 }
 
-/// The id of a folder page's scrollable.
-fn scroll_id(tag: &str) -> iced::advanced::widget::Id {
-    format!("{tag}/scroll").into()
+/// Where the context menu goes for a press at `pointer`: below and after
+/// it, or flipped to stay inside the `window`.
+fn menu_position(pointer: Point, window: Size) -> Point {
+    let size = Size::new(MENU_WIDTH, menu_height(2));
+    let x = if pointer.x + size.width > window.width {
+        pointer.x - size.width
+    } else {
+        pointer.x
+    };
+    let y = if pointer.y + size.height > window.height {
+        pointer.y - size.height
+    } else {
+        pointer.y
+    };
+
+    Point::new(x.max(0.0), y.max(0.0))
 }
 
-/// The id of what stands for an entry on a folder page — the icon of its
-/// row or tile — to scroll it into view by.
-fn anchor_id(tag: &str, uid: &str) -> iced::advanced::widget::Id {
-    format!("{tag}/{uid}").into()
+/// The height of a menu of `items`, in its popover's margin.
+fn menu_height(items: usize) -> f32 {
+    items as f32 * metrics::MENU_ITEM_MIN_HEIGHT + 2.0 * metrics::MENU_MARGIN
 }
 
 /// A page's title, over a subtitle only when there is one: an empty
@@ -1628,9 +1958,9 @@ impl Section {
 mod tests {
     use super::*;
 
-    fn upload(uploaded: u64, skipped: u64, failures: &[(&str, Option<&str>)]) -> Upload {
-        Upload {
-            uploaded,
+    fn upload(uploaded: u64, skipped: u64, failures: &[(&str, Option<&str>)]) -> Transfer {
+        Transfer {
+            transferred: uploaded,
             skipped,
             failures: failures
                 .iter()
@@ -1641,18 +1971,18 @@ mod tests {
 
     #[test]
     fn only_failures_are_told() {
-        assert_eq!(upload_failure(&upload(3, 1, &[])), None);
+        assert_eq!(transfer_failure("upload", &upload(3, 1, &[])), None);
         assert_eq!(
-            upload_failure(&upload(0, 0, &[("a.txt", Some("Too big"))])),
+            transfer_failure("upload", &upload(0, 0, &[("a.txt", Some("Too big"))])),
             Some("Could not upload “a.txt”: Too big".to_owned())
         );
         assert_eq!(
-            upload_failure(&upload(1, 0, &[("b", None)])),
+            transfer_failure("upload", &upload(1, 0, &[("b", None)])),
             Some("Could not upload “b”".to_owned())
         );
         assert_eq!(
-            upload_failure(&upload(1, 0, &[("b", None), ("c", None)])),
-            Some("Could not upload 2 files".to_owned())
+            transfer_failure("upload", &upload(1, 0, &[("b", None), ("c", None)])),
+            Some("Could not upload 2 items".to_owned())
         );
     }
 }
