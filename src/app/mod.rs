@@ -31,7 +31,7 @@ use std::time::Instant;
 
 use crate::config::{Config, View};
 use crate::drive::{self, Account, Cli, Details, Entry, Kind, Login, Transfer};
-use crate::files::{self, Class, Content, Opened};
+use crate::files::{self, Class, Content, Document, Opened};
 use crate::format;
 
 mod dialogs;
@@ -896,6 +896,13 @@ impl App {
             };
             let child = self.push(PageKind::Folder(child));
             return self.load(&child);
+        }
+
+        // A Proton Docs document or Sheets spreadsheet has no file to
+        // download: it opens on docs.proton.me, as the web client opens it.
+        if let Some(url) = files::document_url(&entry) {
+            tracing::info!(name = %entry.name, "opening a document in the browser");
+            return Task::perform(files::open_externally(url), Message::OpenedExternally);
         }
 
         folder.opening = Some(entry.uid.clone());
@@ -1923,6 +1930,8 @@ fn entry_icon(entry: &Entry) -> svg::Handle {
     let media = entry.media_type.as_deref().unwrap_or_default();
     match files::classify(entry) {
         Class::Image | Class::Svg => icons::image_x_generic(),
+        Class::Document(Document::Doc) => icons::x_office_document(),
+        Class::Document(Document::Sheet) => icons::x_office_spreadsheet(),
         Class::Text => icons::text_x_generic(),
         Class::Other if media.starts_with("audio/") => icons::audio_x_generic(),
         Class::Other if media.starts_with("video/") => icons::video_x_generic(),

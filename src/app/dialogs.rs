@@ -16,7 +16,7 @@ use libadwaita_iced::{Element, Widget, icons, typography, widget as adw};
 
 use super::{App, Dialog, Message};
 use crate::drive::{self, Kind, Source};
-use crate::format;
+use crate::{files, format};
 
 /// The New Folder dialog's name entry, focused as the dialog opens.
 pub(super) const NEW_FOLDER_NAME: &str = "new-folder-name";
@@ -188,10 +188,13 @@ impl App {
         let kind = match entry.kind {
             Kind::Folder => "Folder".to_owned(),
             Kind::Device => "Computer".to_owned(),
-            Kind::File => entry
-                .media_type
-                .clone()
-                .unwrap_or_else(|| "File".to_owned()),
+            Kind::File => match files::classify(entry) {
+                files::Class::Document(document) => document.description().to_owned(),
+                _ => entry
+                    .media_type
+                    .clone()
+                    .unwrap_or_else(|| "File".to_owned()),
+            },
         };
 
         let heading = column![

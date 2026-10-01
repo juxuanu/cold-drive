@@ -18,7 +18,49 @@ pub enum Class {
     Text,
     Image,
     Svg,
+    /// A Proton Docs document or Proton Sheets spreadsheet: no file, but a
+    /// page of docs.proton.me, which the CLI does not download.
+    Document(Document),
     Other,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Document {
+    Doc,
+    Sheet,
+}
+
+impl Document {
+    /// The SDK's `isProtonDocument` and `isProtonSheet`.
+    fn of(media_type: &str) -> Option<Self> {
+        match media_type {
+            "application/vnd.proton.doc" => Some(Self::Doc),
+            "application/vnd.proton.sheet" => Some(Self::Sheet),
+            _ => None,
+        }
+    }
+
+    pub fn description(self) -> &'static str {
+        match self {
+            Self::Doc => "Proton Docs document",
+            Self::Sheet => "Proton Sheets spreadsheet",
+        }
+    }
+}
+
+/// Where a Proton Docs document or Sheets spreadsheet opens, as the SDK's
+/// `getNodeUrl` makes it from the node's volume and id.
+pub fn document_url(entry: &Entry) -> Option<String> {
+    let document = Document::of(entry.media_type.as_deref()?)?;
+    let (volume, node) = entry.uid.split_once('~')?;
+    let kind = match document {
+        Document::Doc => "doc",
+        Document::Sheet => "sheet",
+    };
+
+    Some(format!(
+        "https://docs.proton.me/doc?type={kind}&mode=open&volumeId={volume}&linkId={node}"
+    ))
 }
 
 /// A downloaded file, ready to show.
@@ -40,6 +82,9 @@ pub enum Content {
 /// What `entry` most likely is, from its media type and its name.
 pub fn classify(entry: &Entry) -> Class {
     let media = entry.media_type.as_deref().unwrap_or_default();
+    if let Some(document) = Document::of(media) {
+        return Class::Document(document);
+    }
     let extension = Path::new(&entry.name)
         .extension()
         .and_then(|ext| ext.to_str())
@@ -203,6 +248,8 @@ pub async fn load(path: PathBuf, class: Class) -> Result<Opened, Error> {
     let content = match class {
         Class::Image => Content::Image,
         Class::Svg => Content::Svg,
+        // Opened on docs.proton.me before anything is downloaded.
+        Class::Document(_) => Content::External,
         Class::Text | Class::Other => {
             let size = tokio::fs::metadata(&path).await?.len();
             if size > MAX_TEXT_BYTES {
@@ -317,6 +364,19 @@ mod tests {
             Class::Other
         );
         assert_eq!(classify(&file("a.heic", Some("image/heic"))), Class::Other);
+    }
+
+    #[test]
+    fn proton_documents_open_on_docs_proton_me() {
+        let mut doc = file("Test doc", Some("application/vnd.proton.doc"));
+        doc.uid = "vol==~node==".into();
+
+        assert_eq!(classify(&doc), Class::Document(Document::Doc));
+        assert_eq!(
+            document_url(&doc).as_deref(),
+            Some("https://docs.proton.me/doc?type=doc&mode=open&volumeId=vol==&linkId=node==")
+        );
+        assert_eq!(document_url(&file("a.txt", Some("text/plain"))), None);
     }
 
     #[test]
