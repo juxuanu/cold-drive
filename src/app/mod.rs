@@ -27,7 +27,7 @@ use libadwaita_iced::{
 use crate::config::{Config, View};
 use crate::drive::{self, Account, Cli, Entry, Kind, Login};
 use crate::files::{self, Class, Content, Opened};
-use crate::{format, icons as more_icons};
+use crate::format;
 
 mod dialogs;
 
@@ -778,8 +778,8 @@ impl App {
             PageKind::Folder(folder) => {
                 let parent = folder.trail.rsplit_once(" / ").map(|(parent, _)| parent);
                 let toggle = match self.config.view {
-                    View::List => more_icons::view_grid(),
-                    View::Grid => more_icons::view_list(),
+                    View::List => icons::view_grid(),
+                    View::Grid => icons::view_list(),
                 };
                 let bar = self
                     .content_bar(
@@ -791,7 +791,7 @@ impl App {
                         adw::icon_button(toggle)
                             .style(adw::button::flat)
                             .on_press(Message::ToggleView),
-                        adw::icon_button(more_icons::view_refresh())
+                        adw::icon_button(icons::view_refresh())
                             .style(adw::button::flat)
                             .on_press(Message::Reload(page.tag.clone())),
                     ]);
@@ -821,7 +821,7 @@ impl App {
                         collapsed,
                     )
                     .end(
-                        adw::icon_button(icons::external_link())
+                        adw::icon_button(icons::adw_external_link())
                             .style(adw::button::flat)
                             .on_press(Message::OpenExternally(
                                 viewer.file.to_string_lossy().into_owned(),
@@ -848,7 +848,7 @@ impl App {
             Listing::Loading => return center(spinner().size(32)).boxed(),
             Listing::Failed(error) => {
                 return status_page()
-                    .icon(more_icons::network_offline())
+                    .icon(icons::network_offline())
                     .title("Could Not Load Folder")
                     .description(error.as_str())
                     .child(
@@ -865,7 +865,7 @@ impl App {
                     ("Folder Is Empty", "")
                 };
                 return status_page()
-                    .icon(more_icons::folder())
+                    .icon(icons::folder())
                     .title(title)
                     .description(description)
                     .boxed();
@@ -1045,7 +1045,7 @@ impl App {
 
     fn signed_out_page(&self) -> Element<'_, Message> {
         let page = status_page()
-            .icon(more_icons::network_workgroup())
+            .icon(icons::network_workgroup())
             .title("Sign In to Proton Drive")
             .description(
                 "Sign in once in your browser, on this device or another; the CLI keeps the \
@@ -1070,9 +1070,9 @@ impl App {
         if let Some(url) = &sign_in.url {
             actions = actions.push(
                 row![
-                    adw::icon_text_button(icons::external_link(), "Open Browser")
+                    adw::icon_text_button(icons::adw_external_link(), "Open Browser")
                         .on_press(Message::OpenExternally(url.clone())),
-                    adw::icon_text_button(more_icons::edit_copy(), "Copy Link")
+                    adw::icon_text_button(icons::edit_copy(), "Copy Link")
                         .on_press(Message::CopyText(url.clone())),
                 ]
                 .spacing(12)
@@ -1145,22 +1145,22 @@ fn page_title<'a>(
 
 fn entry_icon(entry: &Entry) -> svg::Handle {
     match entry.kind {
-        Kind::Device => return more_icons::computer(),
-        Kind::Folder => return more_icons::folder(),
+        Kind::Device => return icons::computer(),
+        Kind::Folder => return icons::folder(),
         Kind::File => {}
     }
 
     let media = entry.media_type.as_deref().unwrap_or_default();
     match files::classify(entry) {
-        Class::Image | Class::Svg => more_icons::image_x_generic(),
-        Class::Text => more_icons::text_x_generic(),
-        Class::Other if media.starts_with("audio/") => more_icons::audio_x_generic(),
-        Class::Other if media.starts_with("video/") => more_icons::video_x_generic(),
+        Class::Image | Class::Svg => icons::image_x_generic(),
+        Class::Text => icons::text_x_generic(),
+        Class::Other if media.starts_with("audio/") => icons::audio_x_generic(),
+        Class::Other if media.starts_with("video/") => icons::video_x_generic(),
         Class::Other if media.contains("spreadsheet") || media.contains("excel") => {
-            more_icons::x_office_spreadsheet()
+            icons::x_office_spreadsheet()
         }
         Class::Other if media.contains("presentation") || media.contains("powerpoint") => {
-            more_icons::x_office_presentation()
+            icons::x_office_presentation()
         }
         Class::Other
             if media == "application/pdf"
@@ -1168,7 +1168,7 @@ fn entry_icon(entry: &Entry) -> svg::Handle {
                 || media.contains("msword")
                 || media.contains("rtf") =>
         {
-            more_icons::x_office_document()
+            icons::x_office_document()
         }
         Class::Other
             if [
@@ -1185,12 +1185,12 @@ fn entry_icon(entry: &Entry) -> svg::Handle {
             .iter()
             .any(|kind| media.contains(kind)) =>
         {
-            more_icons::package_x_generic()
+            icons::package_x_generic()
         }
         Class::Other if media.contains("executable") || media.contains("x-msdownload") => {
-            more_icons::application_x_executable()
+            icons::application_x_executable()
         }
-        Class::Other => more_icons::text_x_generic(),
+        Class::Other => icons::text_x_generic(),
     }
 }
 
@@ -1225,11 +1225,11 @@ impl Section {
 
     fn icon(self) -> svg::Handle {
         match self {
-            Section::MyFiles => more_icons::user_home(),
-            Section::Devices => more_icons::computer(),
-            Section::SharedWithMe => more_icons::folder_remote(),
-            Section::SharedByMe => more_icons::folder_publicshare(),
-            Section::Trash => more_icons::user_trash(),
+            Section::MyFiles => icons::user_home(),
+            Section::Devices => icons::computer(),
+            Section::SharedWithMe => icons::folder_remote(),
+            Section::SharedByMe => icons::folder_publicshare(),
+            Section::Trash => icons::user_trash(),
         }
     }
 

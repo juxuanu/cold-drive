@@ -6,7 +6,6 @@ mod config;
 mod drive;
 mod files;
 mod format;
-mod icons;
 
 use std::io::IsTerminal;
 

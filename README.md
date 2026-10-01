@@ -41,6 +41,3 @@ lookup, so deep folders don't need a name lookup at every level.
 
 Opened files are downloaded, decrypted, into `$XDG_CACHE_HOME/cold-pass/files`,
 one directory per revision. That directory is wiped at startup and at log-out.
-
-Icons not embedded by libadwaita-iced come from adwaita-icon-theme
-(`assets/icons`, LGPL-3.0 or CC-BY-SA-3.0).

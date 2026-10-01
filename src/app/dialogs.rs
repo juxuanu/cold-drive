@@ -10,7 +10,7 @@ use libadwaita_iced::{Element, Widget, icons};
 
 use super::{App, Dialog, Message};
 use crate::drive::{self, Source};
-use crate::{format, icons as more_icons};
+use crate::format;
 
 const REPOSITORY: &str = "https://github.com/juxuanu/cold-pass";
 
@@ -140,7 +140,7 @@ impl App {
         );
 
         about_dialog::about_dialog()
-            .application_icon(more_icons::folder_remote())
+            .application_icon(icons::folder_remote())
             .application_name("Cold Pass")
             .developer_name("juxuanu")
             .version(env!("CARGO_PKG_VERSION"))

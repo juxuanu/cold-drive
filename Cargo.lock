@@ -1841,7 +1841,7 @@ checksum = "7a79a3332a6609480d7d0c9eab957bca6b455b91bb84e66d19f5ff66294b85b8"
 [[package]]
 name = "libadwaita_iced"
 version = "0.1.0"
-source = "git+https://gitlab.com/juxuanu/libadwaita-iced?rev=03908a956214efb39c88067722673a9757fb07be#03908a956214efb39c88067722673a9757fb07be"
+source = "git+https://gitlab.com/juxuanu/libadwaita-iced?rev=715dbd23729a760a90ac936e1898eb33e8f4988c#715dbd23729a760a90ac936e1898eb33e8f4988c"
 dependencies = [
  "iced",
  "iced_wgpu",
