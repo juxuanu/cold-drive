@@ -1,16 +1,23 @@
 //! The preferences and about dialogs.
 
+use iced::widget::column;
 use libadwaita_iced::widget::about_dialog;
 use libadwaita_iced::widget::view_switcher::page;
 use libadwaita_iced::widget::{
     action_row, button_row, entry_row, preferences_dialog, preferences_group, preferences_page,
     spinner,
 };
-use libadwaita_iced::{Element, Widget, icons};
+use libadwaita_iced::widget::{
+    alert_dialog, response, shortcuts_dialog, shortcuts_item, shortcuts_section,
+};
+use libadwaita_iced::{Element, Widget, icons, typography, widget as adw};
 
 use super::{App, Dialog, Message};
 use crate::drive::{self, Source};
 use crate::format;
+
+/// The New Folder dialog's name entry, focused as the dialog opens.
+pub(super) const NEW_FOLDER_NAME: &str = "new-folder-name";
 
 const REPOSITORY: &str = "https://github.com/juxuanu/cold-pass";
 
@@ -19,6 +26,8 @@ impl App {
         match which {
             Dialog::Preferences => self.preferences(),
             Dialog::About => self.about(),
+            Dialog::NewFolder => self.new_folder(),
+            Dialog::Shortcuts => shortcuts(),
         }
     }
 
@@ -127,6 +136,43 @@ impl App {
         )
     }
 
+    /// Files' New Folder dialog: a name, checked as it is typed, and Create.
+    fn new_folder(&self) -> Element<'_, Message> {
+        let name = self
+            .new_folder
+            .as_ref()
+            .map_or("", |new_folder| new_folder.name.as_str());
+        let problem = self.new_folder_problem();
+        let valid = problem.is_ok();
+        let why = problem.err().flatten();
+
+        let entry = adw::text_input("Folder name", name)
+            .id(NEW_FOLDER_NAME)
+            .on_input(Message::NewFolderNamed)
+            .on_submit_maybe(valid.then_some(Message::CreateFolder))
+            .style(if why.is_some() {
+                adw::text_input::error
+            } else {
+                adw::text_input::default
+            });
+
+        let mut content = column![entry].spacing(6);
+        if let Some(why) = why {
+            content = content.push(typography::caption(why).style(adw::text::error).boxed());
+        }
+
+        alert_dialog("New Folder")
+            .child(content)
+            .response(response("Cancel", Message::CloseDialog))
+            .response(
+                response("Create", Message::CreateFolder)
+                    .suggested()
+                    .enabled(valid)
+                    .default_response(),
+            )
+            .boxed()
+    }
+
     fn about(&self) -> Element<'_, Message> {
         let cli = self.cli.as_ref().map_or_else(
             || "not found".to_owned(),
@@ -180,6 +226,29 @@ impl App {
             .toasts(&self.toasts, Message::ToastDismissed)
             .boxed()
     }
+}
+
+/// Every shortcut the window answers, as `subscription` and the
+/// navigation view take them.
+fn shortcuts() -> Element<'static, Message> {
+    shortcuts_dialog()
+        .section(
+            shortcuts_section("General")
+                .item(shortcuts_item("Preferences", "<Control>comma"))
+                .item(shortcuts_item("Keyboard Shortcuts", "<Control>question")),
+        )
+        .section(
+            shortcuts_section("Files")
+                .item(shortcuts_item("Upload Files", "<Control>u"))
+                .item(shortcuts_item("New Folder", "<Control>n"))
+                .item(shortcuts_item("Refresh", "F5 <Control>r")),
+        )
+        .section(
+            shortcuts_section("Navigation")
+                .item(shortcuts_item("Back", "<Alt>Left <Alt>Up Escape")),
+        )
+        .on_close(Message::CloseDialog)
+        .boxed()
 }
 
 /// A row showing a value: the title as a dimmed caption over it, as

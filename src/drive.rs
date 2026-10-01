@@ -263,6 +263,47 @@ impl Cli {
         Err(Error::Failed("The download finished without a file".into()))
     }
 
+    /// Creates a folder called `name` in the folder at `parent`.
+    pub async fn create_folder(self, parent: String, name: String) -> Result<(), Error> {
+        // After `--`, a name starting with `-` is not taken for an option.
+        self.run([
+            "filesystem",
+            "create-folder",
+            "--json",
+            "--",
+            &parent,
+            &name,
+        ])
+        .await
+        .map(|_| ())
+    }
+
+    /// Uploads `files` into the folder at `parent`. A file whose name is
+    /// taken is uploaded under another, as "Keep Both" would; one whose
+    /// content is already there is skipped by the CLI.
+    pub async fn upload(self, files: Vec<PathBuf>, parent: String) -> Result<Upload, Error> {
+        let mut args: Vec<OsString> = [
+            "filesystem",
+            "upload",
+            "--json",
+            "--file-conflict-strategy",
+            "rename",
+            "--",
+        ]
+        .map(OsString::from)
+        .into();
+        args.extend(files.into_iter().map(OsString::from));
+        args.push(parent.into());
+
+        // The summary is printed whether or not every file made it; the
+        // exit status only says that one did not.
+        let (stdout, outcome) = self.execute(args).await?;
+        match parse_json::<Summary>(&stdout) {
+            Ok(summary) => Ok(summary.into()),
+            Err(error) => outcome.and(Err(error)),
+        }
+    }
+
     pub async fn logout(self) -> Result<(), Error> {
         self.run(["auth", "logout"]).await.map(|_| ())
     }
@@ -339,6 +380,18 @@ impl Cli {
         I: IntoIterator<Item = S>,
         S: AsRef<std::ffi::OsStr>,
     {
+        let (stdout, outcome) = self.execute(args).await?;
+
+        outcome.map(|()| stdout)
+    }
+
+    /// Runs the CLI: what it printed, and how it ended — for the commands
+    /// that print a result even when they fail.
+    async fn execute<I, S>(&self, args: I) -> Result<(String, Result<(), Error>), Error>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<std::ffi::OsStr>,
+    {
         let mut command = self.command(args);
         let line = describe(&command);
         tracing::debug!(command = %line, "running");
@@ -356,7 +409,7 @@ impl Cli {
             if !stderr.trim().is_empty() {
                 tracing::debug!(command = %line, stderr = %stderr.trim(), "the CLI said");
             }
-            Ok(stdout)
+            Ok((stdout, Ok(())))
         } else {
             let said = if stderr.trim().is_empty() {
                 &stdout
@@ -370,7 +423,8 @@ impl Cli {
                 output = %said.trim(),
                 "failed",
             );
-            Err(failure(said, output.status))
+            let failure = failure(said, output.status);
+            Ok((stdout, Err(failure)))
         }
     }
 }
@@ -437,6 +491,60 @@ fn parse_json<T: serde::de::DeserializeOwned>(stdout: &str) -> Result<T, Error> 
     let start = stdout.find(['[', '{']).unwrap_or(0);
 
     serde_json::from_str(&stdout[start..]).map_err(|error| Error::Parse(error.to_string()))
+}
+
+/// How an upload went.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Upload {
+    pub uploaded: u64,
+    /// Files whose content was already there.
+    pub skipped: u64,
+    /// Each file that failed, with why when the CLI says.
+    pub failures: Vec<(String, Option<String>)>,
+}
+
+/// What a transfer prints with `--json` once it is over.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct Summary {
+    transferred_items: u64,
+    skipped_items: u64,
+    #[serde(default)]
+    failures: Vec<SummaryFailure>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SummaryFailure {
+    name: String,
+    /// A message from newer CLIs; 0.8 prints the error object itself,
+    /// which is `{}` once in JSON.
+    error: Option<serde_json::Value>,
+}
+
+impl From<Summary> for Upload {
+    fn from(summary: Summary) -> Self {
+        let failures = summary
+            .failures
+            .into_iter()
+            .map(|failure| {
+                let reason = match failure.error {
+                    Some(serde_json::Value::String(message)) => Some(message),
+                    Some(error) => error
+                        .get("message")
+                        .and_then(|message| message.as_str())
+                        .map(str::to_owned),
+                    None => None,
+                };
+                (failure.name, reason.filter(|reason| !reason.is_empty()))
+            })
+            .collect();
+
+        Self {
+            uploaded: summary.transferred_items,
+            skipped: summary.skipped_items,
+            failures,
+        }
+    }
 }
 
 /// The SDK's `Result<string, Error | InvalidNameError>`: an undecryptable
@@ -717,6 +825,26 @@ mod tests {
             Some("CLI 0.4.1")
         );
         assert_eq!(versions("unexpected"), None);
+    }
+
+    #[test]
+    fn upload_summaries_are_read_from_either_version() {
+        let current = r#"{"transferredItems":2,"transferredBytes":10,"skippedItems":1,"failedItems":1,"failures":[{"name":"a.txt","error":"ValidationError: Too big"}]}"#;
+        let release = r#"{"transferredItems":0,"transferredBytes":0,"skippedItems":0,"failedItems":1,"failures":[{"name":"b.txt","nodeUid":"x","error":{}}]}"#;
+
+        let current: Upload = parse_json::<Summary>(current).unwrap().into();
+        let release: Upload = parse_json::<Summary>(release).unwrap().into();
+
+        assert_eq!(current.uploaded, 2);
+        assert_eq!(current.skipped, 1);
+        assert_eq!(
+            current.failures,
+            [(
+                "a.txt".to_owned(),
+                Some("ValidationError: Too big".to_owned())
+            )]
+        );
+        assert_eq!(release.failures, [("b.txt".to_owned(), None)]);
     }
 
     #[test]

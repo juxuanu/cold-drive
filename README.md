@@ -8,7 +8,11 @@ official [Proton Drive CLI](https://github.com/ProtonDriveApps/sdk/blob/main/cli
 - Open text files and images inside the app (read-only, with select and copy;
   images zoom and pan).
 - Open everything else in the desktop's default application.
+- Upload files (Ctrl+U) and create folders (Ctrl+N) from the + menu beside the
+  title; what arrives is selected and scrolled into view. A file whose name is
+  taken is uploaded under another name rather than replacing it.
 - List or grid view, remembered between runs.
+- Keyboard shortcuts in a dialog (Ctrl+?).
 - Sign in through the browser; the preferences show the account and the CLI in
   use, set the CLI's path and log out.
 - No thumbnails: the CLI cannot fetch the ones Proton stores, so files show

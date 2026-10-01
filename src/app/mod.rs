@@ -9,6 +9,7 @@ use iced::widget::grid::Sizing;
 use iced::widget::{center, column, container, grid, image, row, svg, text, text_editor};
 use iced::{Alignment, Fill, Font, Subscription, Task};
 use libadwaita_iced::widget::about_dialog::Page as AboutPage;
+use libadwaita_iced::widget::boxed_list::{ListRow, RowStyle};
 use libadwaita_iced::widget::breakpoint_bin::{self, breakpoint_bin};
 use libadwaita_iced::widget::navigation_view::NavigationPage;
 use libadwaita_iced::widget::popover_menu::{item, menu_button, separator};
@@ -20,22 +21,29 @@ use libadwaita_iced::widget::{
     toolbar_view, window_title,
 };
 use libadwaita_iced::{
-    AccentColor, Adwaita, ColorScheme, Contrast, Element, Widget, icons, typography, widget as adw,
-    window,
+    AccentColor, Adwaita, ColorScheme, Contrast, Element, Widget, color, icons, metrics,
+    typography, widget as adw, window,
 };
 
 use crate::config::{Config, View};
-use crate::drive::{self, Account, Cli, Entry, Kind, Login};
+use crate::drive::{self, Account, Cli, Entry, Kind, Login, Upload};
 use crate::files::{self, Class, Content, Opened};
 use crate::format;
 
 mod dialogs;
+mod reveal;
 
 /// A grid cell's widest; the columns are as many as fit.
 const TILE_WIDTH: f32 = 128.0;
 
 /// Width over height of a grid cell: the icon over two lines of name.
 const TILE_ASPECT_RATIO: f32 = 0.95;
+
+/// Around a row's icon, the rest of the row, scrolled into view with it.
+const ROW_MARGIN: f32 = 24.0;
+
+/// Around a tile's icon, the rest of the tile: the name below it.
+const TILE_MARGIN: f32 = 56.0;
 
 /// Where the CLI is to be had.
 const CLI_DOWNLOAD: &str = "https://proton.me/download/drive/cli/index.html";
@@ -67,12 +75,24 @@ pub struct App {
     cli_version: Option<Result<String, String>>,
     account: Option<Result<Account, String>>,
     about_pages: Vec<AboutPage>,
+    new_folder: Option<NewFolder>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Dialog {
     Preferences,
     About,
+    NewFolder,
+    Shortcuts,
+}
+
+/// The folder being named in the New Folder dialog.
+struct NewFolder {
+    /// The page of the folder it goes in.
+    tag: String,
+    name: String,
+    /// Asked for, so a second Create is not.
+    creating: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -104,6 +124,15 @@ struct Folder {
     filter: String,
     /// The file being downloaded to open, by UID.
     opening: Option<String>,
+    /// Whether files and folders can be added here.
+    writable: bool,
+    /// Uploads into the folder still running.
+    uploads: usize,
+    /// Names to select once the folder is next listed: what was just
+    /// created or uploaded into it.
+    reveal: Vec<String>,
+    /// The entries selected, by UID: shown highlighted.
+    selected: Vec<String>,
 }
 
 enum Listing {
@@ -172,6 +201,17 @@ pub enum Message {
     AccountLoaded(Result<Account, drive::Error>),
     AboutPush(AboutPage),
     AboutPop,
+
+    UploadTo(String),
+    UploadHere,
+    Picked(String, Vec<PathBuf>),
+    /// The folder's page, the files' names.
+    Uploaded(String, Vec<String>, Result<Upload, drive::Error>),
+    NewFolderIn(String),
+    NewFolderHere,
+    NewFolderNamed(String),
+    CreateFolder,
+    FolderCreated(String, String, Result<(), drive::Error>),
 }
 
 impl App {
@@ -203,6 +243,7 @@ impl App {
             cli_version: None,
             account: None,
             about_pages: Vec::new(),
+            new_folder: None,
         };
 
         let load = app.open_section(Section::MyFiles);
@@ -222,9 +263,20 @@ impl App {
             iced::window::resize_events().map(|_| Message::Resized),
             iced::system::theme_changes().map(Message::SystemScheme),
             keyboard::listen().filter_map(|event| match event {
+                // `?` is Shift and another key on most layouts, so it is
+                // matched as typed, as GTK's `<Control>question` is.
+                keyboard::Event::KeyPressed {
+                    modified_key: Key::Character(character),
+                    modifiers,
+                    ..
+                } if character == "?" && modifiers.command() => {
+                    Some(Message::ShowDialog(Dialog::Shortcuts))
+                }
                 keyboard::Event::KeyPressed { key, modifiers, .. } => match key.as_ref() {
                     Key::Named(Named::F5) => Some(Message::RefreshTop),
                     Key::Character("r") if modifiers.command() => Some(Message::RefreshTop),
+                    Key::Character("u") if modifiers.command() => Some(Message::UploadHere),
+                    Key::Character("n") if modifiers.command() => Some(Message::NewFolderHere),
                     Key::Character(",") if modifiers.command() => {
                         Some(Message::ShowDialog(Dialog::Preferences))
                     }
@@ -263,7 +315,32 @@ impl App {
             Message::Listed(tag, result) => {
                 if let Some(folder) = self.folder_mut(&tag) {
                     folder.listing = match result {
-                        Ok(entries) => Listing::Loaded(entries),
+                        Ok(entries) => {
+                            let reveal = std::mem::take(&mut folder.reveal);
+                            folder.selected = entries
+                                .iter()
+                                .filter(|entry| reveal.contains(&entry.name))
+                                .map(|entry| entry.uid.clone())
+                                .collect();
+                            let first = folder.selected.first().cloned();
+                            if first.is_some() {
+                                // What is selected must not be filtered out.
+                                folder.filter.clear();
+                            }
+                            folder.listing = Listing::Loaded(entries);
+
+                            let view = self.config.view;
+                            return first.map_or_else(Task::none, |uid| {
+                                reveal::reveal(
+                                    scroll_id(&tag),
+                                    anchor_id(&tag, &uid),
+                                    match view {
+                                        View::List => ROW_MARGIN,
+                                        View::Grid => TILE_MARGIN,
+                                    },
+                                )
+                            });
+                        }
                         Err(drive::Error::AuthRequired) => {
                             self.signed_out = true;
                             return Task::none();
@@ -278,6 +355,7 @@ impl App {
             Message::Filtered(tag, filter) => {
                 if let Some(folder) = self.folder_mut(&tag) {
                     folder.filter = filter;
+                    folder.selected.clear();
                 }
             }
             Message::Reload(tag) => return self.load(&tag),
@@ -392,7 +470,10 @@ impl App {
                 }
             }
             Message::CloseDialog => self.dialog_open = false,
-            Message::DialogClosed => self.dialog = None,
+            Message::DialogClosed => {
+                self.dialog = None;
+                self.new_folder = None;
+            }
             Message::CliPathInput(path) => self.cli_path_input = path,
             Message::ApplyCliPath => return self.apply_cli_path(),
             Message::CliVersion(result) => {
@@ -406,6 +487,62 @@ impl App {
             Message::AboutPop => {
                 self.about_pages.pop();
             }
+
+            Message::UploadHere => {
+                if let Some(tag) = self.writable_top() {
+                    return self.update(Message::UploadTo(tag));
+                }
+            }
+            Message::UploadTo(tag) => {
+                tracing::debug!(%tag, "choosing files to upload");
+                return Task::perform(
+                    rfd::AsyncFileDialog::new()
+                        .set_title("Upload Files")
+                        .pick_files(),
+                    move |files| {
+                        let files = files
+                            .unwrap_or_default()
+                            .into_iter()
+                            .map(|file| file.path().to_owned())
+                            .collect();
+                        Message::Picked(tag.clone(), files)
+                    },
+                );
+            }
+            Message::Picked(tag, files) => return self.upload(&tag, files),
+            Message::Uploaded(tag, names, result) => return self.uploaded(&tag, names, result),
+            Message::NewFolderHere => {
+                if let Some(tag) = self.writable_top() {
+                    return self.update(Message::NewFolderIn(tag));
+                }
+            }
+            Message::NewFolderIn(tag) => {
+                self.new_folder = Some(NewFolder {
+                    tag,
+                    name: String::new(),
+                    creating: false,
+                });
+                self.dialog = Some(Dialog::NewFolder);
+                self.dialog_open = true;
+                return iced::widget::operation::focus(dialogs::NEW_FOLDER_NAME);
+            }
+            Message::NewFolderNamed(name) => {
+                if let Some(new_folder) = &mut self.new_folder {
+                    new_folder.name = name;
+                }
+            }
+            Message::CreateFolder => return self.create_folder(),
+            Message::FolderCreated(tag, name, result) => match result {
+                Ok(()) => {
+                    tracing::info!(%name, "folder created");
+                    if let Some(folder) = self.folder_mut(&tag) {
+                        folder.reveal = vec![name];
+                    }
+                    return self.load(&tag);
+                }
+                Err(drive::Error::AuthRequired) => self.signed_out = true,
+                Err(error) => self.toast(format!("Could not create “{name}”: {error}")),
+            },
         }
 
         Task::none()
@@ -453,6 +590,10 @@ impl App {
             listing: Listing::Loading,
             filter: String::new(),
             opening: None,
+            writable: section == Section::MyFiles,
+            uploads: 0,
+            reveal: Vec::new(),
+            selected: Vec::new(),
         }));
 
         self.load(&tag)
@@ -500,6 +641,7 @@ impl App {
         let Some(entry) = entries.iter().find(|entry| entry.uid == uid).cloned() else {
             return Task::none();
         };
+        folder.selected.clear();
 
         if entry.is_folder() {
             let child = Folder {
@@ -509,6 +651,12 @@ impl App {
                 listing: Listing::Loading,
                 filter: String::new(),
                 opening: None,
+                // Anything below a section's root is a folder, but what is
+                // in the trash stays as it is.
+                writable: self.section != Section::Trash,
+                uploads: 0,
+                reveal: Vec::new(),
+                selected: Vec::new(),
             };
             let child = self.push(PageKind::Folder(child));
             return self.load(&child);
@@ -602,6 +750,152 @@ impl App {
     fn toast(&mut self, title: String) {
         tracing::info!(toast = %title);
         self.toasts.add(toast::toast(title));
+    }
+
+    /// The folder on top of the stack, if files and folders can go in it.
+    fn writable_top(&self) -> Option<String> {
+        self.live_pages()
+            .last()
+            .filter(|page| matches!(&page.kind, PageKind::Folder(folder) if folder.writable))
+            .map(|page| page.tag.clone())
+    }
+
+    fn upload(&mut self, tag: &str, files: Vec<PathBuf>) -> Task<Message> {
+        let Some(cli) = self.cli.clone() else {
+            return Task::none();
+        };
+        if files.is_empty() {
+            return Task::none();
+        }
+        let Some(folder) = self.folder_mut(tag) else {
+            return Task::none();
+        };
+
+        folder.uploads += 1;
+        let parent = folder.path.clone();
+        let names: Vec<String> = files
+            .iter()
+            .map(|file| {
+                file.file_name()
+                    .unwrap_or(file.as_os_str())
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect();
+        tracing::info!(files = ?files, %parent, "uploading");
+
+        // The spinner in the header bar shows it is under way.
+        let tag = tag.to_owned();
+        Task::perform(cli.upload(files, parent), move |result| {
+            Message::Uploaded(tag.clone(), names.clone(), result)
+        })
+    }
+
+    fn uploaded(
+        &mut self,
+        tag: &str,
+        names: Vec<String>,
+        result: Result<Upload, drive::Error>,
+    ) -> Task<Message> {
+        if let Some(folder) = self.folder_mut(tag) {
+            folder.uploads = folder.uploads.saturating_sub(1);
+            // What arrived, or was already there, is selected; only what
+            // failed is told.
+            folder.reveal = names;
+        }
+
+        let upload = match result {
+            Ok(upload) => upload,
+            Err(drive::Error::AuthRequired) => {
+                self.signed_out = true;
+                return Task::none();
+            }
+            Err(error) => {
+                self.toast(format!("Could not upload: {error}"));
+                return self.load(tag);
+            }
+        };
+
+        for (name, reason) in &upload.failures {
+            tracing::warn!(%name, reason = reason.as_deref().unwrap_or("unknown"), "upload failed");
+        }
+        tracing::info!(
+            uploaded = upload.uploaded,
+            skipped = upload.skipped,
+            "upload done"
+        );
+        if let Some(failure) = upload_failure(&upload) {
+            self.toast(failure);
+        }
+
+        // The listing shows what arrived, or what was already there.
+        self.load(tag)
+    }
+
+    fn create_folder(&mut self) -> Task<Message> {
+        let Some(cli) = self.cli.clone() else {
+            return Task::none();
+        };
+        let Some(new_folder) = &self.new_folder else {
+            return Task::none();
+        };
+        if new_folder.creating || !self.new_folder_problem().is_ok() {
+            return Task::none();
+        }
+
+        let tag = new_folder.tag.clone();
+        let name = new_folder.name.trim().to_owned();
+        let Some(parent) = self.folder_mut(&tag).map(|folder| folder.path.clone()) else {
+            return Task::none();
+        };
+
+        if let Some(new_folder) = &mut self.new_folder {
+            new_folder.creating = true;
+        }
+        self.dialog_open = false;
+        tracing::info!(%name, %parent, "creating a folder");
+
+        Task::perform(cli.create_folder(parent, name.clone()), move |result| {
+            Message::FolderCreated(tag.clone(), name.clone(), result)
+        })
+    }
+
+    /// What is wrong with the name in the New Folder dialog: `Err(None)`
+    /// while there is no name yet, `Err(Some(why))` for one that cannot be,
+    /// as Files words it.
+    fn new_folder_problem(&self) -> Result<(), Option<String>> {
+        let Some(new_folder) = &self.new_folder else {
+            return Err(None);
+        };
+        let name = new_folder.name.trim();
+
+        if name.is_empty() {
+            return Err(None);
+        }
+        if name.contains('/') {
+            return Err(Some("Folder names cannot contain “/”.".into()));
+        }
+        if name == "." || name == ".." {
+            return Err(Some(format!("A folder cannot be called “{name}”.")));
+        }
+        if name.len() > 255 {
+            return Err(Some("Folder name is too long.".into()));
+        }
+
+        let siblings = self.pages.iter().find_map(|page| match &page.kind {
+            PageKind::Folder(Folder {
+                listing: Listing::Loaded(entries),
+                ..
+            }) if page.tag == new_folder.tag => Some(entries),
+            _ => None,
+        });
+        match siblings.and_then(|entries| entries.iter().find(|entry| entry.name == name)) {
+            Some(entry) if entry.is_folder() => {
+                Err(Some("A folder with that name already exists.".into()))
+            }
+            Some(_) => Err(Some("A file with that name already exists.".into())),
+            None => Ok(()),
+        }
     }
 
     fn save_settings(&self) -> Task<Message> {
@@ -737,6 +1031,11 @@ impl App {
                     .accelerator("Ctrl+,")
                     .on_activate(Message::ShowDialog(Dialog::Preferences)),
             )
+            .push(
+                item("Keyboard Shortcuts")
+                    .accelerator("Ctrl+?")
+                    .on_activate(Message::ShowDialog(Dialog::Shortcuts)),
+            )
             .push(item("About Cold Pass").on_activate(Message::ShowDialog(Dialog::About)))
             .boxed()
     }
@@ -781,7 +1080,23 @@ impl App {
                     View::List => icons::view_grid(),
                     View::Grid => icons::view_list(),
                 };
-                let bar = self
+                // While an upload runs, the spinner stands where Refresh
+                // would: the listing is refreshed once it is done.
+                let refresh: Element<'_, Message> = if folder.uploads > 0 {
+                    container(spinner())
+                        .width(metrics::BUTTON_IMAGE_MIN_SIZE.width)
+                        .height(metrics::BUTTON_IMAGE_MIN_SIZE.height)
+                        .align_x(Alignment::Center)
+                        .align_y(Alignment::Center)
+                        .boxed()
+                } else {
+                    adw::icon_button(icons::view_refresh())
+                        .style(adw::button::flat)
+                        .on_press(Message::Reload(page.tag.clone()))
+                        .boxed()
+                };
+
+                let mut bar = self
                     .content_bar(
                         page_title(&folder.title, parent, backdrop),
                         depth,
@@ -791,10 +1106,11 @@ impl App {
                         adw::icon_button(toggle)
                             .style(adw::button::flat)
                             .on_press(Message::ToggleView),
-                        adw::icon_button(icons::view_refresh())
-                            .style(adw::button::flat)
-                            .on_press(Message::Reload(page.tag.clone())),
+                        refresh,
                     ]);
+                if folder.writable {
+                    bar = bar.start(add_menu(&page.tag));
+                }
 
                 (
                     folder.title.as_str(),
@@ -909,6 +1225,7 @@ impl App {
                 .maximum_size(860)
                 .tightening_threshold(600),
         )
+        .id(scroll_id(tag))
         .boxed()
     }
 
@@ -927,16 +1244,29 @@ impl App {
             .wrapping(text::Wrapping::WordOrGlyph)
             .ellipsis(text::Ellipsis::End);
 
+        let selected = folder.selected.contains(&entry.uid);
+
         adw::button(
             column![
-                center(glyph).height(64),
+                center(glyph).height(64).id(anchor_id(tag, &entry.uid)),
                 // Two lines of the name at most.
                 container(name).height(36).clip(true),
             ]
             .spacing(6)
             .align_x(Alignment::Center),
         )
-        .style(adw::button::flat)
+        .style(move |theme: &Adwaita, status| {
+            let style = adw::button::flat(theme, status);
+            if selected {
+                // A selected item in an icon view: washed in the accent.
+                adw::button::Style {
+                    background: Some(color::alpha(theme.colors().accent_bg, 0.25).into()),
+                    ..style
+                }
+            } else {
+                style
+            }
+        })
         .width(Fill)
         .height(Fill)
         .padding(6)
@@ -944,12 +1274,7 @@ impl App {
         .boxed()
     }
 
-    fn row<'a>(
-        &self,
-        tag: &str,
-        folder: &Folder,
-        entry: &'a Entry,
-    ) -> adw::action_row::ActionRow<'a, Message> {
+    fn row<'a>(&self, tag: &str, folder: &Folder, entry: &'a Entry) -> ListRow<'a, Message> {
         let mut details = Vec::new();
         if entry.kind == Kind::File
             && let Some(size) = entry.size
@@ -963,20 +1288,29 @@ impl App {
             details.push("Shared".to_owned());
         }
 
+        // The icon as a prefix lays out as `.icon` would, and carries the
+        // id the row is scrolled into view by.
         let mut row = action_row(entry.name.as_str())
-            .icon(entry_icon(entry))
+            .prefix(container(icon(entry_icon(entry))).id(anchor_id(tag, &entry.uid)))
             .on_activate(Message::Activated(tag.to_owned(), entry.uid.clone()));
         if !details.is_empty() {
             row = row.subtitle(details.join(" · "));
         }
 
-        if folder.opening.as_deref() == Some(entry.uid.as_str()) {
+        let row = if folder.opening.as_deref() == Some(entry.uid.as_str()) {
             row.suffix(spinner())
         } else if entry.is_folder() {
             row.suffix(icon(icons::go_next()))
         } else {
             row
-        }
+        };
+
+        let selected = folder.selected.contains(&entry.uid);
+        ListRow::from(row).style(if selected {
+            RowStyle::Suggested
+        } else {
+            RowStyle::Plain
+        })
     }
 
     fn viewer<'a>(&'a self, tag: &'a str, viewer: &'a Viewer) -> Element<'a, Message> {
@@ -1128,6 +1462,45 @@ async fn open(cli: Cli, entry: Entry) -> Result<Opened, drive::Error> {
     files::load(file, files::classify(&entry)).await
 }
 
+/// The menu to add to a folder: files from the computer, or a new folder.
+fn add_menu(tag: &str) -> Element<'static, Message> {
+    menu_button(icon(icons::list_add()))
+        .style(adw::button::flat)
+        .image_button()
+        .push(
+            item("Upload Files…")
+                .accelerator("Ctrl+U")
+                .on_activate(Message::UploadTo(tag.to_owned())),
+        )
+        .push(
+            item("New Folder…")
+                .accelerator("Ctrl+N")
+                .on_activate(Message::NewFolderIn(tag.to_owned())),
+        )
+        .boxed()
+}
+
+/// What an upload's toast says: what failed, if anything did.
+fn upload_failure(upload: &Upload) -> Option<String> {
+    match upload.failures.as_slice() {
+        [] => None,
+        [(name, Some(reason))] => Some(format!("Could not upload “{name}”: {reason}")),
+        [(name, None)] => Some(format!("Could not upload “{name}”")),
+        failures => Some(format!("Could not upload {} files", failures.len())),
+    }
+}
+
+/// The id of a folder page's scrollable.
+fn scroll_id(tag: &str) -> iced::advanced::widget::Id {
+    format!("{tag}/scroll").into()
+}
+
+/// The id of what stands for an entry on a folder page — the icon of its
+/// row or tile — to scroll it into view by.
+fn anchor_id(tag: &str, uid: &str) -> iced::advanced::widget::Id {
+    format!("{tag}/{uid}").into()
+}
+
 /// A page's title, over a subtitle only when there is one: an empty
 /// subtitle still takes its line, and lifts the title off centre.
 fn page_title<'a>(
@@ -1248,5 +1621,38 @@ impl Section {
             Section::SharedByMe => ("Nothing Shared", "Files you share show here"),
             Section::Trash => ("Trash Is Empty", ""),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn upload(uploaded: u64, skipped: u64, failures: &[(&str, Option<&str>)]) -> Upload {
+        Upload {
+            uploaded,
+            skipped,
+            failures: failures
+                .iter()
+                .map(|(name, reason)| ((*name).to_owned(), reason.map(str::to_owned)))
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn only_failures_are_told() {
+        assert_eq!(upload_failure(&upload(3, 1, &[])), None);
+        assert_eq!(
+            upload_failure(&upload(0, 0, &[("a.txt", Some("Too big"))])),
+            Some("Could not upload “a.txt”: Too big".to_owned())
+        );
+        assert_eq!(
+            upload_failure(&upload(1, 0, &[("b", None)])),
+            Some("Could not upload “b”".to_owned())
+        );
+        assert_eq!(
+            upload_failure(&upload(1, 0, &[("b", None), ("c", None)])),
+            Some("Could not upload 2 files".to_owned())
+        );
     }
 }
