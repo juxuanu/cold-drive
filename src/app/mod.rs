@@ -1288,7 +1288,27 @@ impl App {
     /// The items' context menu: a popover without its tail, as libadwaita's
     /// context menus are, of `popover.menu` rows.
     fn context_menu(&self, menu: &ContextMenu) -> Element<'_, Message> {
-        let item = |label: &'static str, message: Message| {
+        // What Download takes: the selection, as far as it is shown.
+        let selected = self
+            .pages
+            .iter()
+            .find_map(|page| match &page.kind {
+                PageKind::Folder(folder) if page.tag == menu.tag => Some(folder),
+                _ => None,
+            })
+            .map_or(0, |folder| {
+                folder
+                    .shown()
+                    .iter()
+                    .filter(|entry| folder.selected.contains(&entry.uid))
+                    .count()
+            });
+        let download = match selected {
+            1 => "Download 1 File…".to_owned(),
+            count => format!("Download {count} Files…"),
+        };
+
+        let item = |label: String, message: Message| {
             adw::button(
                 typography::label(label)
                     .width(Fill)
@@ -1315,9 +1335,9 @@ impl App {
         };
 
         container(column![
-            item("Download…", Message::Download(menu.tag.clone())),
+            item(download, Message::Download(menu.tag.clone())),
             item(
-                "Info",
+                "Info".to_owned(),
                 Message::ShowInfo(menu.tag.clone(), menu.uid.clone())
             ),
         ])
