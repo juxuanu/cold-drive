@@ -9,7 +9,7 @@ official [Proton Drive CLI](https://github.com/ProtonDriveApps/sdk/blob/main/cli
   images zoom and pan).
 - Open everything else in the desktop's default application.
 - Upload files (Ctrl+U) and create folders (Ctrl+N) from the + menu beside the
-  title; what arrives is selected. A file whose name is
+  title; what arrives is selected and scrolled into view. A file whose name is
   taken is uploaded under another name rather than replacing it.
 - A click selects, Ctrl+click adds to the selection and Shift+click selects a
   run; a double click opens. A right click offers Download… (the selection,

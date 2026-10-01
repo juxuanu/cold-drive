@@ -1,11 +1,10 @@
-//! How selected entries look, after libadwaita's stylesheet: a selected row
-//! or grid child is washed in the accent — `$view_selected_color`, 25%, and
-//! 32% and 39% under the pointer and pressed — and keeps its text colour.
+//! How a selected grid item looks, after libadwaita's stylesheet: washed in
+//! the accent — `$view_selected_color`, 25%, and 32% and 39% under the
+//! pointer and pressed — keeping its text colour. A selected row the library
+//! draws itself, `ListRow::selected`.
 
 use iced::Border;
-use iced::border::Radius;
 use libadwaita_iced::metrics::{radius, state};
-use libadwaita_iced::widget::boxed_list::{self, RowStyle};
 use libadwaita_iced::widget::button::{Status, Style};
 use libadwaita_iced::widget::support::{self, Surface};
 use libadwaita_iced::{Adwaita, color};
@@ -19,21 +18,6 @@ fn selected_wash(theme: &Adwaita, status: Status) -> iced::Color {
     };
 
     color::alpha(theme.colors().accent_bg, opacity)
-}
-
-/// A row of a boxed list: the library's own row look, or, selected,
-/// `.boxed-list > row:selected` — the accent wash over the card, which the
-/// list draws beneath. `corners` are the card's corners the row owns.
-pub fn row(theme: &Adwaita, status: Status, selected: bool, corners: Radius) -> Style {
-    let plain = boxed_list::row_style(theme, status, RowStyle::Plain, corners);
-    if !selected {
-        return plain;
-    }
-
-    Style {
-        background: Some(selected_wash(theme, status).into()),
-        ..plain
-    }
 }
 
 /// A child of an icon view — `gridview > child`: `$button_radius` round,
@@ -96,33 +80,17 @@ mod tests {
             (Status::Hovered, state::VIEW_SELECTED_HOVER),
             (Status::Pressed, state::VIEW_SELECTED_ACTIVE),
         ] {
-            for style in [
-                row(&theme, status, true, Radius::new(0.0)),
-                tile(&theme, status, true),
-            ] {
-                let Some(Background::Color(wash)) = style.background else {
-                    panic!("a selected item is washed");
-                };
-                assert_eq!((wash.r, wash.g, wash.b), (accent.r, accent.g, accent.b));
-                assert!((wash.a - accent.a * opacity).abs() < 1e-6);
-            }
+            let Some(Background::Color(wash)) = tile(&theme, status, true).background else {
+                panic!("a selected item is washed");
+            };
+            assert_eq!((wash.r, wash.g, wash.b), (accent.r, accent.g, accent.b));
+            assert!((wash.a - accent.a * opacity).abs() < 1e-6);
         }
     }
 
     #[test]
     fn unselected_items_keep_their_own_look() {
         let theme = Adwaita::light();
-        let corners = Radius::new(12.0);
-
-        assert_eq!(
-            alpha(&row(&theme, Status::Hovered, false, corners)),
-            alpha(&boxed_list::row_style(
-                &theme,
-                Status::Hovered,
-                RowStyle::Plain,
-                corners
-            ))
-        );
         assert_eq!(alpha(&tile(&theme, Status::Active, false)), None);
         assert!(alpha(&tile(&theme, Status::Hovered, false)).is_some());
     }

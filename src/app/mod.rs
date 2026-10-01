@@ -408,11 +408,18 @@ impl App {
                                 .map(|entry| entry.uid.clone())
                                 .collect();
                             folder.anchor = folder.selected.first().cloned();
-                            if !folder.selected.is_empty() {
-                                // What is selected must not be filtered out.
-                                folder.filter.clear();
-                            }
-                            Listing::Loaded(entries)
+                            folder.listing = Listing::Loaded(entries);
+
+                            // What was just made or uploaded is selected,
+                            // and brought into sight unfiltered.
+                            let Some(first) = folder.selected.first() else {
+                                return Task::none();
+                            };
+                            folder.filter.clear();
+                            return adw::scrollable::scroll_into_view(
+                                scroll_id(&tag),
+                                item_id(&tag, first),
+                            );
                         }
                         Err(drive::Error::AuthRequired) => {
                             self.signed_out = true;
@@ -745,19 +752,21 @@ impl App {
                 )
                 .boxed();
 
-                // The context menu floats over the window at the pointer;
-                // a press anywhere else puts it away.
-                let shell = match &self.menu {
+                // The context menu floats over the window at the pointer; a
+                // press anywhere else puts it away. The layer is always
+                // there, empty without a menu, so that opening one does not
+                // rebuild the window under it and lose its scroll positions.
+                let menu: Element<'_, Message> = match &self.menu {
                     Some(menu) => stack![
-                        shell,
                         mouse_area(space().width(Fill).height(Fill))
                             .on_press(Message::CloseMenu)
                             .on_right_press(Message::CloseMenu),
                         pin(self.context_menu(menu)).position(menu.position),
                     ]
                     .boxed(),
-                    None => shell,
+                    None => space().boxed(),
                 };
+                let shell = stack![shell, menu].boxed();
 
                 pointer::pointer_area(shell, Message::RightPressed).boxed()
             }
@@ -1558,11 +1567,14 @@ impl App {
         };
 
         // A press that no item takes is on the folder itself.
-        mouse_area(adw::scrollable(
-            clamp(column![search, list].spacing(12).padding([24, 12]))
-                .maximum_size(860)
-                .tightening_threshold(600),
-        ))
+        mouse_area(
+            adw::scrollable(
+                clamp(column![search, list].spacing(12).padding([24, 12]))
+                    .maximum_size(860)
+                    .tightening_threshold(600),
+            )
+            .id(scroll_id(tag)),
+        )
         .on_press(Message::Deselect(tag.to_owned()))
         .boxed()
     }
@@ -1599,9 +1611,11 @@ impl App {
         .padding(6)
         .on_press(Message::Clicked(tag.to_owned(), entry.uid.clone()));
 
-        mouse_area(tile)
-            .on_right_press(Message::ItemMenu(tag.to_owned(), entry.uid.clone()))
-            .boxed()
+        container(
+            mouse_area(tile).on_right_press(Message::ItemMenu(tag.to_owned(), entry.uid.clone())),
+        )
+        .id(item_id(tag, &entry.uid))
+        .boxed()
     }
 
     /// An entry in the list: the library's action row, pressed through a
@@ -1633,21 +1647,15 @@ impl App {
             row
         };
 
-        let selected = folder.selected.contains(&entry.uid);
-        let on_press = Message::Clicked(tag.to_owned(), entry.uid.clone());
-        let on_menu = Message::ItemMenu(tag.to_owned(), entry.uid.clone());
-        let header = row.header();
+        // The row's header as the library lays it, in a row of the list as
+        // it builds one, with a secondary click heard on it and an id to
+        // scroll it into view by.
+        let header = mouse_area(row.header())
+            .on_right_press(Message::ItemMenu(tag.to_owned(), entry.uid.clone()));
 
-        ListRow::positioned(move |corners| {
-            adw::button(mouse_area(header).on_right_press(on_menu))
-                .on_press(on_press)
-                .padding(boxed_list::ROW_PADDING)
-                .min_size(Size::ZERO)
-                .width(Fill)
-                .style(move |theme, status| selection::row(theme, status, selected, corners))
-                .boxed()
-        })
-        .padding(0.0)
+        ListRow::new(container(header).id(item_id(tag, &entry.uid)))
+            .on_activate(Message::Clicked(tag.to_owned(), entry.uid.clone()))
+            .selected(folder.selected.contains(&entry.uid))
     }
 
     fn viewer<'a>(&'a self, tag: &'a str, viewer: &'a Viewer) -> Element<'a, Message> {
@@ -1826,6 +1834,16 @@ fn transfer_failure(verb: &str, transfer: &Transfer) -> Option<String> {
         [(name, None)] => Some(format!("Could not {verb} “{name}”")),
         failures => Some(format!("Could not {verb} {} items", failures.len())),
     }
+}
+
+/// The id of a folder page's scrollable.
+fn scroll_id(tag: &str) -> iced::advanced::widget::Id {
+    format!("{tag}/scroll").into()
+}
+
+/// The id of an entry's row or tile on a folder page.
+fn item_id(tag: &str, uid: &str) -> iced::advanced::widget::Id {
+    format!("{tag}/{uid}").into()
 }
 
 /// Where the context menu goes for a press at `pointer`: below and after
