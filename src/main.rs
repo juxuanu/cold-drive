@@ -13,8 +13,11 @@ use libadwaita_iced::{typography, window};
 use tracing_subscriber::EnvFilter;
 
 /// What is logged unless `RUST_LOG` says otherwise: every CLI call, and
-/// only warnings from the libraries.
-const DEFAULT_LOG: &str = "warn,cold_pass=info";
+/// only warnings from the libraries — but `sctk_adwaita`'s. winit builds its
+/// decoration frame on Wayland even with decorations off, only to hide it,
+/// and the frame warns about every button in GNOME's `button-layout` it does
+/// not draw, such as `icon`.
+const DEFAULT_LOG: &str = "warn,sctk_adwaita=error,cold_pass=info";
 
 fn main() -> iced::Result {
     tracing_subscriber::fmt()
