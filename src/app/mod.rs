@@ -66,7 +66,7 @@ pub struct App {
     cli_version: Option<Result<String, String>>,
     account: Option<Result<Account, String>>,
     about_pages: Vec<AboutPage>,
-    new_folder: Option<NewFolder>,
+    naming: Option<Naming>,
     info: Option<Info>,
 }
 
@@ -89,12 +89,25 @@ pub enum Dialog {
 }
 
 /// The folder being named in the New Folder dialog.
-struct NewFolder {
-    /// The page of the folder it goes in.
+/// The naming dialog: a folder to create, or an item to rename.
+struct Naming {
+    /// The page of the folder it is in.
     tag: String,
     name: String,
-    /// Asked for, so a second Create is not.
-    creating: bool,
+    /// Asked for, so a second Create or Rename is not.
+    busy: bool,
+    /// The item being renamed; `None` for a new folder.
+    rename: Option<Entry>,
+}
+
+impl Naming {
+    /// What is being named, as the dialog words it.
+    fn kind(&self) -> &'static str {
+        match &self.rename {
+            Some(entry) if !entry.is_folder() => "File",
+            _ => "Folder",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -255,9 +268,15 @@ pub enum Message {
     Uploaded(String, Vec<String>, Result<Transfer, drive::Error>),
     NewFolderIn(String),
     NewFolderHere,
-    NewFolderNamed(String),
-    CreateFolder,
+    /// Rename the item, by the page it is on and its UID.
+    RenameIn(String, String),
+    /// Rename the one item selected, F2.
+    RenameSelected,
+    NameTyped(String),
+    NameSubmitted,
     FolderCreated(String, String, Result<(), drive::Error>),
+    /// The page, the old name, the new name, and how it went.
+    Renamed(String, String, String, Result<(), drive::Error>),
 }
 
 impl App {
@@ -289,7 +308,7 @@ impl App {
             cli_version: None,
             account: None,
             about_pages: Vec::new(),
-            new_folder: None,
+            naming: None,
             info: None,
         };
 
@@ -325,6 +344,7 @@ impl App {
                     Key::Character("r") if modifiers.command() => Some(Message::RefreshTop),
                     Key::Character("u") if modifiers.command() => Some(Message::UploadHere),
                     Key::Character("n") if modifiers.command() => Some(Message::NewFolderHere),
+                    Key::Named(Named::F2) => Some(Message::RenameSelected),
                     Key::Character(",") if modifiers.command() => {
                         Some(Message::ShowDialog(Dialog::Preferences))
                     }
@@ -633,7 +653,7 @@ impl App {
             Message::CloseDialog => self.dialog_open = false,
             Message::DialogClosed => {
                 self.dialog = None;
-                self.new_folder = None;
+                self.naming = None;
                 self.info = None;
             }
             Message::CliPathInput(path) => self.cli_path_input = path,
@@ -679,21 +699,83 @@ impl App {
                 }
             }
             Message::NewFolderIn(tag) => {
-                self.new_folder = Some(NewFolder {
+                self.naming = Some(Naming {
                     tag,
                     name: String::new(),
-                    creating: false,
+                    busy: false,
+                    rename: None,
                 });
                 self.dialog = Some(Dialog::NewFolder);
                 self.dialog_open = true;
-                return iced::widget::operation::focus(dialogs::NEW_FOLDER_NAME);
+                return iced::widget::operation::focus(dialogs::NAME_ENTRY);
             }
-            Message::NewFolderNamed(name) => {
-                if let Some(new_folder) = &mut self.new_folder {
-                    new_folder.name = name;
+            Message::RenameSelected => {
+                let Some(tag) = self.writable_top() else {
+                    return Task::none();
+                };
+                let selected = self
+                    .folder_mut(&tag)
+                    .map(|folder| {
+                        folder
+                            .selected_entries()
+                            .iter()
+                            .map(|entry| entry.uid.clone())
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
+                if let [uid] = selected.as_slice() {
+                    return self.update(Message::RenameIn(tag, uid.clone()));
                 }
             }
-            Message::CreateFolder => return self.create_folder(),
+            Message::RenameIn(tag, uid) => {
+                let Some(entry) = self
+                    .folder_mut(&tag)
+                    .and_then(|folder| folder.entry(&uid).cloned())
+                else {
+                    return Task::none();
+                };
+
+                // The name is offered with its stem selected, as Files
+                // offers it: a new name, typed over, keeps the extension.
+                let stem = match (entry.is_folder(), entry.name.rsplit_once('.')) {
+                    (false, Some((stem, extension)))
+                        if !stem.is_empty() && !extension.is_empty() =>
+                    {
+                        stem.chars().count()
+                    }
+                    _ => entry.name.chars().count(),
+                };
+                self.naming = Some(Naming {
+                    tag,
+                    name: entry.name.clone(),
+                    busy: false,
+                    rename: Some(entry),
+                });
+                self.dialog = Some(Dialog::NewFolder);
+                self.dialog_open = true;
+
+                let at = |index| iced::advanced::text::Position { line: 0, index };
+                return iced::widget::operation::focus(dialogs::NAME_ENTRY).chain(
+                    iced::widget::operation::select_range(dialogs::NAME_ENTRY, at(0), at(stem)),
+                );
+            }
+            Message::NameTyped(name) => {
+                if let Some(naming) = &mut self.naming {
+                    naming.name = name;
+                }
+            }
+            Message::NameSubmitted => return self.submit_name(),
+            Message::Renamed(tag, old, new, result) => match result {
+                Ok(()) => {
+                    tracing::info!(from = %old, to = %new, "renamed");
+                    if let Some(folder) = self.folder_mut(&tag) {
+                        folder.select_next = vec![new];
+                    }
+                    return self.load(&tag);
+                }
+                Err(drive::Error::AuthRequired) => self.signed_out = true,
+                Err(error) => self.toast(format!("Could not rename “{old}”: {error}")),
+            },
             Message::FolderCreated(tag, name, result) => match result {
                 Ok(()) => {
                     tracing::info!(%name, "folder created");
@@ -1017,64 +1099,100 @@ impl App {
         self.load(tag)
     }
 
-    fn create_folder(&mut self) -> Task<Message> {
+    /// Takes the name in the naming dialog: a folder created, or the item
+    /// renamed.
+    fn submit_name(&mut self) -> Task<Message> {
         let Some(cli) = self.cli.clone() else {
             return Task::none();
         };
-        let Some(new_folder) = &self.new_folder else {
+        let Some(naming) = &self.naming else {
             return Task::none();
         };
-        if new_folder.creating || !self.new_folder_problem().is_ok() {
+        if naming.busy || !self.name_problem().is_ok() {
             return Task::none();
         }
 
-        let tag = new_folder.tag.clone();
-        let name = new_folder.name.trim().to_owned();
+        let tag = naming.tag.clone();
+        let name = naming.name.trim().to_owned();
+        let rename = naming.rename.clone();
         let Some(parent) = self.folder_mut(&tag).map(|folder| folder.path.clone()) else {
             return Task::none();
         };
 
-        if let Some(new_folder) = &mut self.new_folder {
-            new_folder.creating = true;
+        if let Some(naming) = &mut self.naming {
+            naming.busy = true;
         }
         self.dialog_open = false;
-        tracing::info!(%name, %parent, "creating a folder");
 
-        Task::perform(cli.create_folder(parent, name.clone()), move |result| {
-            Message::FolderCreated(tag.clone(), name.clone(), result)
-        })
+        match rename {
+            Some(entry) => {
+                tracing::info!(from = %entry.name, to = %name, "renaming");
+                let old = entry.name;
+                Task::perform(cli.rename(entry.path, name.clone()), move |result| {
+                    Message::Renamed(tag.clone(), old.clone(), name.clone(), result)
+                })
+            }
+            None => {
+                tracing::info!(%name, %parent, "creating a folder");
+                Task::perform(cli.create_folder(parent, name.clone()), move |result| {
+                    Message::FolderCreated(tag.clone(), name.clone(), result)
+                })
+            }
+        }
     }
 
-    /// What is wrong with the name in the New Folder dialog: `Err(None)`
-    /// while there is no name yet, `Err(Some(why))` for one that cannot be,
-    /// as Files words it.
-    fn new_folder_problem(&self) -> Result<(), Option<String>> {
-        let Some(new_folder) = &self.new_folder else {
+    /// What is wrong with the name in the naming dialog: `Err(None)` while
+    /// there is no name yet, or it is the item's own, `Err(Some(why))` for
+    /// one that cannot be, as Files words it.
+    fn name_problem(&self) -> Result<(), Option<String>> {
+        let Some(naming) = &self.naming else {
             return Err(None);
         };
-        let name = new_folder.name.trim();
+        let name = naming.name.trim();
+        let kind = naming.kind();
 
         if name.is_empty() {
             return Err(None);
         }
+        if naming
+            .rename
+            .as_ref()
+            .is_some_and(|entry| entry.name == name)
+        {
+            return Err(None);
+        }
         if name.contains('/') {
-            return Err(Some("Folder names cannot contain “/”.".into()));
+            return Err(Some(format!("{kind} names cannot contain “/”.")));
         }
         if name == "." || name == ".." {
-            return Err(Some(format!("A folder cannot be called “{name}”.")));
+            return Err(Some(format!(
+                "A {} cannot be called “{name}”.",
+                kind.to_lowercase()
+            )));
         }
         if name.len() > 255 {
-            return Err(Some("Folder name is too long.".into()));
+            return Err(Some(format!("{kind} name is too long.")));
         }
 
         let siblings = self.pages.iter().find_map(|page| match &page.kind {
             PageKind::Folder(Folder {
                 listing: Listing::Loaded(entries),
                 ..
-            }) if page.tag == new_folder.tag => Some(entries),
+            }) if page.tag == naming.tag => Some(entries),
             _ => None,
         });
-        match siblings.and_then(|entries| entries.iter().find(|entry| entry.name == name)) {
+        let taken = siblings.and_then(|entries| {
+            entries
+                .iter()
+                .filter(|entry| {
+                    naming
+                        .rename
+                        .as_ref()
+                        .is_none_or(|own| own.uid != entry.uid)
+                })
+                .find(|entry| entry.name == name)
+        });
+        match taken {
             Some(entry) if entry.is_folder() => {
                 Err(Some("A folder with that name already exists.".into()))
             }
@@ -1482,6 +1600,15 @@ impl App {
                 .into(),
         ];
         if let Some(entry) = shown.get(index) {
+            // One item is renamed; Files' batch rename is not here.
+            if count == 1 {
+                entries.push(
+                    item("Rename…")
+                        .accelerator("F2")
+                        .on_activate(Message::RenameIn(tag.to_owned(), entry.uid.clone()))
+                        .into(),
+                );
+            }
             entries.push(
                 item("Info")
                     .on_activate(Message::ShowInfo(tag.to_owned(), entry.uid.clone()))

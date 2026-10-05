@@ -263,6 +263,13 @@ impl Cli {
         Err(Error::Failed("The download finished without a file".into()))
     }
 
+    /// Renames the node at `path` to `name`, where it is.
+    pub async fn rename(self, path: String, name: String) -> Result<(), Error> {
+        self.run(["filesystem", "rename", "--json", "--", &path, &name])
+            .await
+            .map(|_| ())
+    }
+
     /// Creates a folder called `name` in the folder at `parent`.
     pub async fn create_folder(self, parent: String, name: String) -> Result<(), Error> {
         // After `--`, a name starting with `-` is not taken for an option.

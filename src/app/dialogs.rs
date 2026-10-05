@@ -18,8 +18,8 @@ use super::{App, Dialog, Message};
 use crate::drive::{self, Kind, Source};
 use crate::{files, format};
 
-/// The New Folder dialog's name entry, focused as the dialog opens.
-pub(super) const NEW_FOLDER_NAME: &str = "new-folder-name";
+/// The naming dialog's entry, focused as the dialog opens.
+pub(super) const NAME_ENTRY: &str = "name-entry";
 
 const REPOSITORY: &str = "https://github.com/juxuanu/cold-pass";
 
@@ -28,7 +28,7 @@ impl App {
         match which {
             Dialog::Preferences => self.preferences(),
             Dialog::About => self.about(),
-            Dialog::NewFolder => self.new_folder(),
+            Dialog::NewFolder => self.naming(),
             Dialog::Shortcuts => shortcuts(),
             Dialog::Info => self.info(),
         }
@@ -139,20 +139,25 @@ impl App {
         )
     }
 
-    /// Files' New Folder dialog: a name, checked as it is typed, and Create.
-    fn new_folder(&self) -> Element<'_, Message> {
-        let name = self
-            .new_folder
-            .as_ref()
-            .map_or("", |new_folder| new_folder.name.as_str());
-        let problem = self.new_folder_problem();
+    /// Files' New Folder and Rename dialogs: a name, checked as it is
+    /// typed, and the button that takes it.
+    fn naming(&self) -> Element<'_, Message> {
+        let Some(naming) = &self.naming else {
+            return iced::widget::space().boxed();
+        };
+        let problem = self.name_problem();
         let valid = problem.is_ok();
         let why = problem.err().flatten();
 
-        let entry = adw::text_input("Folder name", name)
-            .id(NEW_FOLDER_NAME)
-            .on_input(Message::NewFolderNamed)
-            .on_submit_maybe(valid.then_some(Message::CreateFolder))
+        let (title, placeholder, button) = match &naming.rename {
+            Some(_) => (format!("Rename {}", naming.kind()), "Name", "Rename"),
+            None => ("New Folder".to_owned(), "Folder name", "Create"),
+        };
+
+        let entry = adw::text_input(placeholder, &naming.name)
+            .id(NAME_ENTRY)
+            .on_input(Message::NameTyped)
+            .on_submit_maybe(valid.then_some(Message::NameSubmitted))
             .style(if why.is_some() {
                 adw::text_input::error
             } else {
@@ -164,11 +169,11 @@ impl App {
             content = content.push(typography::caption(why).style(adw::text::error).boxed());
         }
 
-        alert_dialog("New Folder")
+        alert_dialog(title)
             .child(content)
             .response(response("Cancel", Message::CloseDialog))
             .response(
-                response("Create", Message::CreateFolder)
+                response(button, Message::NameSubmitted)
                     .suggested()
                     .enabled(valid)
                     .default_response(),
@@ -328,6 +333,7 @@ fn shortcuts() -> Element<'static, Message> {
             shortcuts_section("Files")
                 .item(shortcuts_item("Upload Files", "<Control>u"))
                 .item(shortcuts_item("New Folder", "<Control>n"))
+                .item(shortcuts_item("Rename the Selected Item", "F2"))
                 .item(shortcuts_item("Refresh", "F5 <Control>r"))
                 .item(shortcuts_item("Select All", "<Control>a"))
                 .item(shortcuts_item(
