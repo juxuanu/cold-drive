@@ -39,7 +39,18 @@ const TILE_WIDTH: f32 = 128.0;
 /// Where the CLI is to be had.
 const CLI_DOWNLOAD: &str = "https://proton.me/download/drive/cli/index.html";
 
+/// An operation under way — Files' `NautilusProgressInfo`: what it is,
+/// and a detail line under it.
+struct Operation {
+    id: u64,
+    status: String,
+    details: String,
+}
+
 pub struct App {
+    /// The operations running, oldest first.
+    operations: Vec<Operation>,
+    next_operation: u64,
     config: Config,
     cli: Option<Cli>,
     section: Section,
@@ -231,7 +242,7 @@ pub enum Message {
     Escape,
     Download(String),
     DownloadTo(String, Vec<String>, Option<PathBuf>),
-    Downloaded(String, Result<Transfer, drive::Error>),
+    Downloaded(u64, String, Result<Transfer, drive::Error>),
     ShowInfo(String, String),
     InfoLoaded(String, Result<Details, drive::Error>),
     Opened(String, String, Result<Opened, drive::Error>),
@@ -265,7 +276,7 @@ pub enum Message {
     UploadHere,
     Picked(String, Vec<PathBuf>),
     /// The folder's page, the files' names.
-    Uploaded(String, Vec<String>, Result<Transfer, drive::Error>),
+    Uploaded(u64, String, Vec<String>, Result<Transfer, drive::Error>),
     NewFolderIn(String),
     NewFolderHere,
     /// Rename the item, by the page it is on and its UID.
@@ -274,9 +285,9 @@ pub enum Message {
     RenameSelected,
     NameTyped(String),
     NameSubmitted,
-    FolderCreated(String, String, Result<(), drive::Error>),
+    FolderCreated(u64, String, String, Result<(), drive::Error>),
     /// The page, the old name, the new name, and how it went.
-    Renamed(String, String, String, Result<(), drive::Error>),
+    Renamed(u64, String, String, String, Result<(), drive::Error>),
 }
 
 impl App {
@@ -309,6 +320,8 @@ impl App {
             account: None,
             about_pages: Vec::new(),
             naming: None,
+            operations: Vec::new(),
+            next_operation: 0,
             info: None,
         };
 
@@ -498,7 +511,8 @@ impl App {
             }
             Message::DownloadTo(tag, paths, Some(dir)) => return self.download(&tag, paths, dir),
             Message::DownloadTo(_, _, None) => {}
-            Message::Downloaded(tag, result) => {
+            Message::Downloaded(operation, tag, result) => {
+                self.finish(operation);
                 if let Some(folder) = self.folder_mut(&tag) {
                     folder.transfers = folder.transfers.saturating_sub(1);
                 }
@@ -692,7 +706,10 @@ impl App {
                 );
             }
             Message::Picked(tag, files) => return self.upload(&tag, files),
-            Message::Uploaded(tag, names, result) => return self.uploaded(&tag, names, result),
+            Message::Uploaded(operation, tag, names, result) => {
+                self.finish(operation);
+                return self.uploaded(&tag, names, result);
+            }
             Message::NewFolderHere => {
                 if let Some(tag) = self.writable_top() {
                     return self.update(Message::NewFolderIn(tag));
@@ -765,27 +782,41 @@ impl App {
                 }
             }
             Message::NameSubmitted => return self.submit_name(),
-            Message::Renamed(tag, old, new, result) => match result {
+            Message::Renamed(operation, tag, old, new, result) => match result {
                 Ok(()) => {
+                    self.finish(operation);
                     tracing::info!(from = %old, to = %new, "renamed");
                     if let Some(folder) = self.folder_mut(&tag) {
                         folder.select_next = vec![new];
                     }
                     return self.load(&tag);
                 }
-                Err(drive::Error::AuthRequired) => self.signed_out = true,
-                Err(error) => self.toast(format!("Could not rename “{old}”: {error}")),
+                Err(drive::Error::AuthRequired) => {
+                    self.finish(operation);
+                    self.signed_out = true;
+                }
+                Err(error) => {
+                    self.finish(operation);
+                    self.toast(format!("Could not rename “{old}”: {error}"));
+                }
             },
-            Message::FolderCreated(tag, name, result) => match result {
+            Message::FolderCreated(operation, tag, name, result) => match result {
                 Ok(()) => {
+                    self.finish(operation);
                     tracing::info!(%name, "folder created");
                     if let Some(folder) = self.folder_mut(&tag) {
                         folder.select_next = vec![name];
                     }
                     return self.load(&tag);
                 }
-                Err(drive::Error::AuthRequired) => self.signed_out = true,
-                Err(error) => self.toast(format!("Could not create “{name}”: {error}")),
+                Err(drive::Error::AuthRequired) => {
+                    self.finish(operation);
+                    self.signed_out = true;
+                }
+                Err(error) => {
+                    self.finish(operation);
+                    self.toast(format!("Could not create “{name}”: {error}"));
+                }
             },
         }
 
@@ -996,6 +1027,22 @@ impl App {
         }
     }
 
+    /// Registers an operation under way, for the indicator.
+    fn begin(&mut self, status: String, details: String) -> u64 {
+        let id = self.next_operation;
+        self.next_operation += 1;
+        self.operations.push(Operation {
+            id,
+            status,
+            details,
+        });
+        id
+    }
+
+    fn finish(&mut self, id: u64) {
+        self.operations.retain(|operation| operation.id != id);
+    }
+
     fn toast(&mut self, title: String) {
         tracing::info!(toast = %title);
         self.toasts.add(toast::toast(title));
@@ -1013,9 +1060,15 @@ impl App {
         folder.transfers += 1;
         tracing::info!(?paths, dir = %dir.display(), "downloading");
 
+        let short = match paths.len() {
+            1 => "Downloading 1 item".to_owned(),
+            count => format!("Downloading {count} items"),
+        };
+        let operation = self.begin(short, format!("To {}", dir.display()));
+
         let tag = tag.to_owned();
         Task::perform(cli.download_to(paths, dir), move |result| {
-            Message::Downloaded(tag.clone(), result)
+            Message::Downloaded(operation, tag.clone(), result)
         })
     }
 
@@ -1051,10 +1104,17 @@ impl App {
             .collect();
         tracing::info!(files = ?files, %parent, "uploading");
 
+        let into = folder.title.clone();
+        let short = match names.as_slice() {
+            [name] => format!("Uploading “{name}”"),
+            names => format!("Uploading {} files", names.len()),
+        };
+        let operation = self.begin(short, format!("To {into}"));
+
         // The spinner in the header bar shows it is under way.
         let tag = tag.to_owned();
         Task::perform(cli.upload(files, parent), move |result| {
-            Message::Uploaded(tag.clone(), names.clone(), result)
+            Message::Uploaded(operation, tag.clone(), names.clone(), result)
         })
     }
 
@@ -1115,7 +1175,10 @@ impl App {
         let tag = naming.tag.clone();
         let name = naming.name.trim().to_owned();
         let rename = naming.rename.clone();
-        let Some(parent) = self.folder_mut(&tag).map(|folder| folder.path.clone()) else {
+        let Some((parent, into)) = self
+            .folder_mut(&tag)
+            .map(|folder| (folder.path.clone(), folder.title.clone()))
+        else {
             return Task::none();
         };
 
@@ -1128,14 +1191,20 @@ impl App {
             Some(entry) => {
                 tracing::info!(from = %entry.name, to = %name, "renaming");
                 let old = entry.name;
+                let operation = self.begin(
+                    format!("Renaming “{old}” to “{name}”"),
+                    format!("In {into}"),
+                );
                 Task::perform(cli.rename(entry.path, name.clone()), move |result| {
-                    Message::Renamed(tag.clone(), old.clone(), name.clone(), result)
+                    Message::Renamed(operation, tag.clone(), old.clone(), name.clone(), result)
                 })
             }
             None => {
                 tracing::info!(%name, %parent, "creating a folder");
+                let operation =
+                    self.begin(format!("Creating folder “{name}”"), format!("In {into}"));
                 Task::perform(cli.create_folder(parent, name.clone()), move |result| {
-                    Message::FolderCreated(tag.clone(), name.clone(), result)
+                    Message::FolderCreated(operation, tag.clone(), name.clone(), result)
                 })
             }
         }
@@ -1322,6 +1391,42 @@ impl App {
             .boxed()
     }
 
+    /// The operations indicator, after Files' `NautilusProgressIndicator`:
+    /// a flat button with a spinner while something runs, beside the `+`,
+    /// opening a popover with each operation's status and details. `None`
+    /// while nothing runs.
+    fn operations_indicator(&self) -> Option<Element<'_, Message>> {
+        use libadwaita_iced::widget::popover_menu::heading;
+
+        if self.operations.is_empty() {
+            return None;
+        }
+
+        // Each operation: its status as a heading, its details as the
+        // dimmed line under it, as the popover's rows read.
+        let entries = self
+            .operations
+            .iter()
+            .enumerate()
+            .flat_map(|(index, operation)| {
+                let mut entries = Vec::new();
+                if index > 0 {
+                    entries.push(separator());
+                }
+                entries.push(heading(operation.status.clone()));
+                entries.push(item(operation.details.clone()).into());
+                entries
+            });
+
+        Some(
+            menu_button(spinner())
+                .style(adw::button::flat)
+                .image_button()
+                .extend(entries)
+                .boxed(),
+        )
+    }
+
     fn main_menu(&self) -> Element<'_, Message> {
         menu_button(icon(icons::open_menu()))
             .style(adw::button::flat)
@@ -1417,6 +1522,9 @@ impl App {
                 if folder.writable {
                     bar = bar.start(add_menu(&page.tag));
                 }
+                if let Some(indicator) = self.operations_indicator() {
+                    bar = bar.start(indicator);
+                }
 
                 (
                     folder.title.as_str(),
@@ -1441,7 +1549,7 @@ impl App {
                 }
 
                 let subtitle = subtitle.join(" · ");
-                let bar = self
+                let mut bar = self
                     .content_bar(
                         page_title(&viewer.entry.name, Some(&subtitle), backdrop),
                         depth,
@@ -1454,6 +1562,9 @@ impl App {
                                 viewer.file.to_string_lossy().into_owned(),
                             )),
                     );
+                if let Some(indicator) = self.operations_indicator() {
+                    bar = bar.start(indicator);
+                }
 
                 (
                     viewer.entry.name.as_str(),
