@@ -16,6 +16,7 @@ use libadwaita_iced::widget::popover_menu::{item, menu_button, separator};
 use libadwaita_iced::widget::sidebar::{self, Mode as SidebarMode};
 use libadwaita_iced::widget::support::Surface;
 use libadwaita_iced::widget::toast::{self, Toasts};
+use libadwaita_iced::widget::toolbar_view::BarStyle;
 use libadwaita_iced::widget::{action_row as row_metrics, grid_view, list_view};
 use libadwaita_iced::widget::{
     clamp, dialog, header_bar, icon, navigation_page, navigation_split_view, navigation_view,
@@ -1302,10 +1303,19 @@ impl App {
 
                 (
                     folder.title.as_str(),
-                    toolbar_view(self.folder(&page.tag, folder))
-                        .top(bar)
-                        .backdrop(backdrop)
-                        .boxed(),
+                    // The page is the view surface, as Files' is — the list
+                    // paints `--view-bg-color` under its rows — so its bar
+                    // is raised over it, as `AdwToolbarView` pairs them.
+                    toolbar_view(
+                        container(self.folder(&page.tag, folder))
+                            .style(adw::container::view)
+                            .width(Fill)
+                            .height(Fill),
+                    )
+                    .top(bar)
+                    .top_bar_style(BarStyle::Raised)
+                    .backdrop(backdrop)
+                    .boxed(),
                 )
             }
             PageKind::Viewer(viewer) => {
@@ -1334,8 +1344,10 @@ impl App {
 
                 (
                     viewer.entry.name.as_str(),
+                    // Text and images are shown on the view surface too.
                     toolbar_view(self.viewer(&page.tag, viewer))
                         .top(bar)
+                        .top_bar_style(BarStyle::Raised)
                         .backdrop(backdrop)
                         .boxed(),
                 )
@@ -1439,17 +1451,11 @@ impl App {
             }
         };
 
-        // The whole page is the view surface, as Files' is: the list paints
-        // `--view-bg-color` under its rows, and the rest of the page has to
-        // match, or the list shows as a tinted block on the window.
-        container(adw::scrollable(
+        adw::scrollable(
             clamp(column![search, list].spacing(12).padding([24, 12]))
                 .maximum_size(860)
                 .tightening_threshold(600),
-        ))
-        .style(adw::container::view)
-        .width(Fill)
-        .height(Fill)
+        )
         .boxed()
     }
 
