@@ -122,8 +122,36 @@ pub(super) struct Share {
     sharing: Option<Result<Option<Sharing>, String>>,
     email: String,
     role: Role,
+    /// What the invitation email says, in clear text, if anything.
+    message: String,
+    /// Whether the email names the item, in clear text.
+    include_name: bool,
+    /// The link's password and expiry as being edited, applied on demand.
+    link_password: String,
+    link_expiry: String,
     /// A change is under way at the CLI.
     busy: bool,
+}
+
+impl Share {
+    fn link(&self) -> Option<&drive::Link> {
+        match &self.sharing {
+            Some(Ok(Some(sharing))) => sharing.link.as_ref(),
+            _ => None,
+        }
+    }
+
+    /// The expiry as typed, as the CLI takes it: an ISO date, or none;
+    /// `Err` for text that is not a date.
+    fn expiry(&self) -> Result<Option<String>, ()> {
+        let text = self.link_expiry.trim();
+        if text.is_empty() {
+            return Ok(None);
+        }
+        chrono::NaiveDate::parse_from_str(text, "%Y-%m-%d")
+            .map(|date| Some(date.to_string()))
+            .map_err(|_| ())
+    }
 }
 
 /// The folder being named in the New Folder dialog.
@@ -296,10 +324,16 @@ pub enum Message {
     ShareLoaded(String, Result<Option<Sharing>, drive::Error>),
     ShareEmail(String),
     ShareRole(Role),
+    InviteText(String),
+    ShareIncludeName(bool),
     Invite,
     Uninvite(String),
     LinkToggled(bool),
     LinkRole(Role),
+    LinkPassword(String),
+    LinkExpiry(String),
+    /// Send the link's password and expiry as edited.
+    LinkApply,
     /// Escape, outside a dialog: whatever is up first goes.
     Escape,
     Download(String),
@@ -559,6 +593,10 @@ impl App {
                     sharing: None,
                     email: String::new(),
                     role: Role::Viewer,
+                    message: String::new(),
+                    include_name: false,
+                    link_password: String::new(),
+                    link_expiry: String::new(),
                     busy: false,
                 });
                 self.dialog = Some(Dialog::Share);
@@ -575,6 +613,23 @@ impl App {
                     share.busy = false;
                     match result {
                         Ok(sharing) => {
+                            // The link's settings as they stand, to edit.
+                            let link = sharing.as_ref().and_then(|sharing| sharing.link.as_ref());
+                            share.link_password = link
+                                .and_then(|link| link.password.clone())
+                                .unwrap_or_default();
+                            share.link_expiry = link
+                                .and_then(|link| link.expires.as_deref())
+                                .and_then(|expires| {
+                                    chrono::DateTime::parse_from_rfc3339(expires).ok()
+                                })
+                                .map(|expires| {
+                                    expires
+                                        .with_timezone(&chrono::Local)
+                                        .date_naive()
+                                        .to_string()
+                                })
+                                .unwrap_or_default();
                             share.sharing = Some(Ok(sharing));
                             // The entry's "Shared" follows what was done.
                             let shared = matches!(&share.sharing, Some(Ok(Some(_))));
@@ -614,6 +669,55 @@ impl App {
                     share.role = role;
                 }
             }
+            Message::InviteText(message) => {
+                if let Some(share) = &mut self.share {
+                    share.message = message;
+                }
+            }
+            Message::ShareIncludeName(include) => {
+                if let Some(share) = &mut self.share {
+                    share.include_name = include;
+                }
+            }
+            Message::LinkPassword(password) => {
+                if let Some(share) = &mut self.share {
+                    share.link_password = password;
+                }
+            }
+            Message::LinkExpiry(expiry) => {
+                if let Some(share) = &mut self.share {
+                    share.link_expiry = expiry;
+                }
+            }
+            Message::LinkApply => {
+                let Some(cli) = self.cli.clone() else {
+                    return Task::none();
+                };
+                let Some(share) = &mut self.share else {
+                    return Task::none();
+                };
+                let (Some(link), Ok(expiry)) = (share.link(), share.expiry()) else {
+                    return Task::none();
+                };
+                if share.busy {
+                    return Task::none();
+                }
+                let (role, password) = (link.role, Some(share.link_password.clone()));
+                share.busy = true;
+                let (uid, path) = (share.entry.uid.clone(), share.entry.path.clone());
+                tracing::info!(
+                    password = if share.link_password.is_empty() {
+                        "none"
+                    } else {
+                        "set"
+                    },
+                    ?expiry,
+                    "public link settings"
+                );
+                return Task::perform(cli.set_link(path, role, password, expiry), move |result| {
+                    Message::ShareLoaded(uid.clone(), result)
+                });
+            }
             Message::Invite => {
                 let Some(cli) = self.cli.clone() else {
                     return Task::none();
@@ -632,10 +736,13 @@ impl App {
                     share.entry.path.clone(),
                     share.role,
                 );
+                let message = Some(share.message.clone());
+                let include_name = share.include_name;
                 tracing::info!(%email, %role, "inviting");
-                return Task::perform(cli.invite(path, vec![email], role), move |result| {
-                    Message::ShareLoaded(uid.clone(), result)
-                });
+                return Task::perform(
+                    cli.invite(path, vec![email], role, message, include_name),
+                    move |result| Message::ShareLoaded(uid.clone(), result),
+                );
             }
             Message::Uninvite(email) => {
                 let Some(cli) = self.cli.clone() else {
@@ -669,7 +776,7 @@ impl App {
                 tracing::info!(on, "public link");
                 let change = async move {
                     if on {
-                        cli.set_link(path, Role::Viewer).await
+                        cli.set_link(path, Role::Viewer, None, None).await
                     } else {
                         cli.remove_link(path).await
                     }
@@ -688,10 +795,15 @@ impl App {
                 if share.busy {
                     return Task::none();
                 }
+                // The role goes with the password and expiry the link has.
+                let (password, expiry) = match share.link() {
+                    Some(link) => (link.password.clone(), link.expires.clone()),
+                    None => (None, None),
+                };
                 share.busy = true;
                 let (uid, path) = (share.entry.uid.clone(), share.entry.path.clone());
                 tracing::info!(%role, "public link role");
-                return Task::perform(cli.set_link(path, role), move |result| {
+                return Task::perform(cli.set_link(path, role, password, expiry), move |result| {
                     Message::ShareLoaded(uid.clone(), result)
                 });
             }

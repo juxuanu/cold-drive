@@ -284,6 +284,8 @@ impl Cli {
         path: String,
         emails: Vec<String>,
         role: Role,
+        message: Option<String>,
+        include_name: bool,
     ) -> Result<Option<Sharing>, Error> {
         let mut args: Vec<OsString> = ["sharing", "invite", "--json", "--role", role.as_str()]
             .map(OsString::from)
@@ -291,6 +293,14 @@ impl Cli {
         for email in &emails {
             args.push("--user".into());
             args.push(email.into());
+        }
+        // Both go in the email as clear text, so neither is sent unasked.
+        if let Some(message) = message.filter(|message| !message.trim().is_empty()) {
+            args.push("--message".into());
+            args.push(message.into());
+        }
+        if include_name {
+            args.push("--include-node-name".into());
         }
         args.push("--".into());
         args.push(path.into());
@@ -317,19 +327,31 @@ impl Cli {
         parse_sharing(&stdout)
     }
 
-    /// Creates the node's public link, or sets its role.
-    pub async fn set_link(self, path: String, role: Role) -> Result<Option<Sharing>, Error> {
-        let stdout = self
-            .run([
-                "sharing",
-                "set-url",
-                "--json",
-                "--role",
-                role.as_str(),
-                "--",
-                &path,
-            ])
-            .await?;
+    /// Creates the node's public link, or sets it: the role, a password
+    /// (none takes it off), and when it expires, as an ISO date (none
+    /// keeps it for good). The CLI sets all three at once.
+    pub async fn set_link(
+        self,
+        path: String,
+        role: Role,
+        password: Option<String>,
+        expiration: Option<String>,
+    ) -> Result<Option<Sharing>, Error> {
+        let mut args: Vec<OsString> = ["sharing", "set-url", "--json", "--role", role.as_str()]
+            .map(OsString::from)
+            .into();
+        if let Some(password) = password.filter(|password| !password.is_empty()) {
+            args.push("--password".into());
+            args.push(password.into());
+        }
+        if let Some(expiration) = expiration.filter(|expiration| !expiration.is_empty()) {
+            args.push("--expiration".into());
+            args.push(expiration.into());
+        }
+        args.push("--".into());
+        args.push(path.into());
+
+        let stdout = self.run(args).await?;
         parse_sharing(&stdout)
     }
 
@@ -807,7 +829,8 @@ pub struct Member {
 pub struct Link {
     pub url: String,
     pub role: Role,
-    pub has_password: bool,
+    /// The custom password, which the SDK decrypts for the owner.
+    pub password: Option<String>,
     /// RFC 3339.
     pub expires: Option<String>,
     pub downloads: u64,
@@ -869,9 +892,9 @@ fn parse_sharing(stdout: &str) -> Result<Option<Sharing>, Error> {
     let link = result.url_access.map(|access| Link {
         url: access.url,
         role: Role::parse(&access.role).unwrap_or(Role::Viewer),
-        has_password: access
+        password: access
             .custom_password
-            .is_some_and(|password| !password.is_empty()),
+            .filter(|password| !password.is_empty()),
         expires: access.expiration_time,
         downloads: access.number_of_initialized_downloads,
     });
@@ -1388,7 +1411,7 @@ mod tests {
         assert!(sharing.members[1].pending);
         let link = sharing.link.unwrap();
         assert_eq!(link.url, "https://drive.proton.me/urls/x#y");
-        assert!(!link.has_password);
+        assert_eq!(link.password, None);
         assert_eq!(link.downloads, 3);
     }
 

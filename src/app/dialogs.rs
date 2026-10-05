@@ -3,10 +3,11 @@
 use iced::widget::{column, text};
 use iced::{Alignment, Fill};
 use libadwaita_iced::widget::about_dialog;
+use libadwaita_iced::widget::entry_row::EntryStyle;
 use libadwaita_iced::widget::view_switcher::page;
 use libadwaita_iced::widget::{
-    action_row, button_row, combo_row, entry_row, preferences_dialog, preferences_group,
-    preferences_page, spinner, switch_row,
+    action_row, button_row, combo_row, entry_row, password_entry_row, preferences_dialog,
+    preferences_group, preferences_page, spinner, switch_row,
 };
 use libadwaita_iced::widget::{
     alert_dialog, header_bar, icon, response, shortcuts_dialog, shortcuts_item, shortcuts_section,
@@ -237,6 +238,12 @@ impl App {
                             role.label().to_owned()
                         })
                         .on_select(Message::ShareRole),
+                    )
+                    .push(entry_row("Message", &share.message).on_input(Message::InviteText))
+                    .push(
+                        switch_row("Name the Item in the Email", share.include_name)
+                            .subtitle("The message and the name go unencrypted")
+                            .on_toggle(Message::ShareIncludeName),
                     );
 
                 let members = sharing
@@ -272,9 +279,6 @@ impl App {
                         .style(adw::button::flat)
                         .on_press(Message::CopyText(public.url.clone()));
                     let mut about = vec![format!("{} downloads", public.downloads)];
-                    if public.has_password {
-                        about.push("Password".to_owned());
-                    }
                     if let Some(expires) = public.expires.as_deref().and_then(format::full_date) {
                         about.push(format!("Expires {expires}"));
                     }
@@ -292,6 +296,45 @@ impl App {
                                 |role| role.label().to_owned(),
                             )
                             .on_select(Message::LinkRole),
+                        );
+
+                    // The password and the expiry are applied together, as
+                    // the CLI sets them: the apply button shows once either
+                    // differs from the link's.
+                    let expiry_ok = share.expiry().is_ok();
+                    let password_changed =
+                        share.link_password != public.password.clone().unwrap_or_default();
+                    let expiry_changed = share.expiry().ok().flatten()
+                        != public
+                            .expires
+                            .as_deref()
+                            .and_then(|expires| chrono::DateTime::parse_from_rfc3339(expires).ok())
+                            .map(|expires| {
+                                expires
+                                    .with_timezone(&chrono::Local)
+                                    .date_naive()
+                                    .to_string()
+                            });
+                    let apply = (!share.busy && expiry_ok && (password_changed || expiry_changed))
+                        .then_some(Message::LinkApply);
+
+                    link = link
+                        .push(
+                            password_entry_row("Password", &share.link_password)
+                                .on_input(Message::LinkPassword)
+                                .on_submit(Message::LinkApply)
+                                .on_apply(apply.clone()),
+                        )
+                        .push(
+                            entry_row("Expires on (YYYY-MM-DD)", &share.link_expiry)
+                                .on_input(Message::LinkExpiry)
+                                .on_submit(Message::LinkApply)
+                                .on_apply(apply)
+                                .style(if expiry_ok {
+                                    EntryStyle::Default
+                                } else {
+                                    EntryStyle::Error
+                                }),
                         );
                 }
             }
