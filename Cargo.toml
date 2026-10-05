@@ -9,7 +9,7 @@ description = "A GNOME-style Proton Drive browser, built on the proton-drive CLI
 [dependencies]
 # Same pinned iced revision as libadwaita_iced, so both share every type.
 iced = { git = "https://github.com/iced-rs/iced", rev = "84f785b06ac02a49901e4113451fedd31c9c3326", features = ["advanced", "svg", "image", "tokio"] }
-libadwaita_iced = { git = "https://gitlab.com/juxuanu/libadwaita-iced", rev = "9623d5daf6f33bc2d152d1e4c123c21ff1187e30" }
+libadwaita_iced = { git = "https://gitlab.com/juxuanu/libadwaita-iced", rev = "09682ecf3405426ca7f3787ab358bb5032bd795c" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["process", "io-util", "fs", "rt", "macros", "time"] }
