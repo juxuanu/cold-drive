@@ -27,7 +27,9 @@ use libadwaita_iced::{
 };
 
 use crate::config::{Config, View};
-use crate::drive::{self, Account, Cli, Details, Done, Entry, Kind, Login, Transfer};
+use crate::drive::{
+    self, Account, Cli, Details, Done, Entry, Kind, Login, Role, Sharing, Transfer,
+};
 use crate::files::{self, Class, Content, Document, Opened};
 use crate::format;
 
@@ -87,6 +89,7 @@ pub struct App {
     naming: Option<Naming>,
     /// What the Delete alert is about: the page, and the items.
     deleting: Option<(String, Vec<Entry>)>,
+    share: Option<Share>,
     info: Option<Info>,
 }
 
@@ -108,6 +111,19 @@ pub enum Dialog {
     Info,
     /// Files' "Permanently Delete…?" alert.
     Delete,
+    Share,
+}
+
+/// The Share dialog: an item, who it is shared with, and the invitation
+/// being written.
+pub(super) struct Share {
+    entry: Entry,
+    /// `None` while the CLI is asked; `Ok(None)` for an item not shared.
+    sharing: Option<Result<Option<Sharing>, String>>,
+    email: String,
+    role: Role,
+    /// A change is under way at the CLI.
+    busy: bool,
 }
 
 /// The folder being named in the New Folder dialog.
@@ -263,6 +279,16 @@ pub enum Message {
     Deleted(u64, String, Vec<Entry>, Result<Done, drive::Error>),
     /// Delete: the trash on a folder page, for good in the trash.
     DeleteSelected,
+    /// Open the Share dialog on the item.
+    ShareIn(String, String),
+    /// The sharing as the CLI tells it, for the item by UID.
+    ShareLoaded(String, Result<Option<Sharing>, drive::Error>),
+    ShareEmail(String),
+    ShareRole(Role),
+    Invite,
+    Uninvite(String),
+    LinkToggled(bool),
+    LinkRole(Role),
     /// Escape, outside a dialog: whatever is up first goes.
     Escape,
     Download(String),
@@ -346,6 +372,7 @@ impl App {
             about_pages: Vec::new(),
             naming: None,
             deleting: None,
+            share: None,
             operations: Vec::new(),
             next_operation: 0,
             info: None,
@@ -503,6 +530,159 @@ impl App {
                 }
                 // Whatever was done before the kill shows.
                 return self.load(&operation.tag);
+            }
+            Message::ShareIn(tag, uid) => {
+                let Some(cli) = self.cli.clone() else {
+                    return Task::none();
+                };
+                let Some(entry) = self
+                    .folder_mut(&tag)
+                    .and_then(|folder| folder.entry(&uid).cloned())
+                else {
+                    return Task::none();
+                };
+
+                let path = entry.path.clone();
+                self.share = Some(Share {
+                    entry,
+                    sharing: None,
+                    email: String::new(),
+                    role: Role::Viewer,
+                    busy: false,
+                });
+                self.dialog = Some(Dialog::Share);
+                self.dialog_open = true;
+
+                return Task::perform(cli.sharing(path), move |result| {
+                    Message::ShareLoaded(uid.clone(), result)
+                });
+            }
+            Message::ShareLoaded(uid, result) => {
+                if let Some(share) = &mut self.share
+                    && share.entry.uid == uid
+                {
+                    share.busy = false;
+                    match result {
+                        Ok(sharing) => {
+                            share.sharing = Some(Ok(sharing));
+                            // The entry's "Shared" follows what was done.
+                            let shared = matches!(&share.sharing, Some(Ok(Some(_))));
+                            let uid = share.entry.uid.clone();
+                            for page in &mut self.pages {
+                                if let PageKind::Folder(Folder {
+                                    listing: Listing::Loaded(entries),
+                                    ..
+                                }) = &mut page.kind
+                                    && let Some(entry) =
+                                        entries.iter_mut().find(|entry| entry.uid == uid)
+                                {
+                                    entry.shared = shared;
+                                }
+                            }
+                        }
+                        Err(drive::Error::AuthRequired) => self.signed_out = true,
+                        Err(error) => {
+                            tracing::warn!(%error, "sharing failed");
+                            // A change that failed leaves what was known.
+                            if share.sharing.is_none() {
+                                share.sharing = Some(Err(error.to_string()));
+                            } else {
+                                self.toast(format!("Could not change the sharing: {error}"));
+                            }
+                        }
+                    }
+                }
+            }
+            Message::ShareEmail(email) => {
+                if let Some(share) = &mut self.share {
+                    share.email = email;
+                }
+            }
+            Message::ShareRole(role) => {
+                if let Some(share) = &mut self.share {
+                    share.role = role;
+                }
+            }
+            Message::Invite => {
+                let Some(cli) = self.cli.clone() else {
+                    return Task::none();
+                };
+                let Some(share) = &mut self.share else {
+                    return Task::none();
+                };
+                let email = share.email.trim().to_owned();
+                if share.busy || !looks_like_email(&email) {
+                    return Task::none();
+                }
+                share.busy = true;
+                share.email.clear();
+                let (uid, path, role) = (
+                    share.entry.uid.clone(),
+                    share.entry.path.clone(),
+                    share.role,
+                );
+                tracing::info!(%email, %role, "inviting");
+                return Task::perform(cli.invite(path, vec![email], role), move |result| {
+                    Message::ShareLoaded(uid.clone(), result)
+                });
+            }
+            Message::Uninvite(email) => {
+                let Some(cli) = self.cli.clone() else {
+                    return Task::none();
+                };
+                let Some(share) = &mut self.share else {
+                    return Task::none();
+                };
+                if share.busy {
+                    return Task::none();
+                }
+                share.busy = true;
+                let (uid, path) = (share.entry.uid.clone(), share.entry.path.clone());
+                tracing::info!(%email, "removing from the share");
+                return Task::perform(cli.unshare(path, vec![email]), move |result| {
+                    Message::ShareLoaded(uid.clone(), result)
+                });
+            }
+            Message::LinkToggled(on) => {
+                let Some(cli) = self.cli.clone() else {
+                    return Task::none();
+                };
+                let Some(share) = &mut self.share else {
+                    return Task::none();
+                };
+                if share.busy {
+                    return Task::none();
+                }
+                share.busy = true;
+                let (uid, path) = (share.entry.uid.clone(), share.entry.path.clone());
+                tracing::info!(on, "public link");
+                let change = async move {
+                    if on {
+                        cli.set_link(path, Role::Viewer).await
+                    } else {
+                        cli.remove_link(path).await
+                    }
+                };
+                return Task::perform(change, move |result| {
+                    Message::ShareLoaded(uid.clone(), result)
+                });
+            }
+            Message::LinkRole(role) => {
+                let Some(cli) = self.cli.clone() else {
+                    return Task::none();
+                };
+                let Some(share) = &mut self.share else {
+                    return Task::none();
+                };
+                if share.busy {
+                    return Task::none();
+                }
+                share.busy = true;
+                let (uid, path) = (share.entry.uid.clone(), share.entry.path.clone());
+                tracing::info!(%role, "public link role");
+                return Task::perform(cli.set_link(path, role), move |result| {
+                    Message::ShareLoaded(uid.clone(), result)
+                });
             }
             Message::DeleteSelected => {
                 let Some((tag, writable)) = self.top_folder() else {
@@ -854,6 +1034,7 @@ impl App {
                 self.naming = None;
                 self.info = None;
                 self.deleting = None;
+                self.share = None;
             }
             Message::CliPathInput(path) => self.cli_path_input = path,
             Message::ApplyCliPath => return self.apply_cli_path(),
@@ -1975,12 +2156,18 @@ impl App {
                     .on_activate(Message::Download(tag.to_owned()))
                     .into(),
             );
-            // One item is renamed; Files' batch rename is not here.
+            // One item is renamed, or shared; Files' batch rename is not
+            // here.
             if count == 1 {
                 entries.push(
                     item("Rename…")
                         .accelerator("F2")
                         .on_activate(Message::RenameIn(tag.to_owned(), entry.uid.clone()))
+                        .into(),
+                );
+                entries.push(
+                    item("Share…")
+                        .on_activate(Message::ShareIn(tag.to_owned(), entry.uid.clone()))
                         .into(),
                 );
             }
@@ -2268,6 +2455,12 @@ fn on_view<'a>(page: impl Widget<Message> + 'a) -> Element<'a, Message> {
         .boxed()
 }
 
+/// Whether `text` could be an address to invite: something, an `@`, and
+/// something with a dot after it. The server decides the rest.
+fn looks_like_email(text: &str) -> bool {
+    matches!(text.split_once('@'), Some((user, host)) if !user.is_empty() && host.contains('.') && !host.ends_with('.'))
+}
+
 /// `entries` as a toast or an operation names them: the one by name, more
 /// by their count.
 fn describe(entries: &[Entry]) -> String {
@@ -2434,6 +2627,14 @@ mod tests {
                 .map(|(name, reason)| ((*name).to_owned(), reason.map(str::to_owned)))
                 .collect(),
         }
+    }
+
+    #[test]
+    fn addresses_are_checked_loosely() {
+        assert!(looks_like_email("ann@proton.me"));
+        assert!(!looks_like_email("ann"));
+        assert!(!looks_like_email("@proton.me"));
+        assert!(!looks_like_email("ann@proton."));
     }
 
     #[test]

@@ -268,6 +268,86 @@ impl Cli {
         Err(Error::Failed("The download finished without a file".into()))
     }
 
+    /// Who the node at `path` is shared with, and its public link; `None`
+    /// when it is not shared at all.
+    pub async fn sharing(self, path: String) -> Result<Option<Sharing>, Error> {
+        let stdout = self
+            .run(["sharing", "status", "--json", "--", &path])
+            .await?;
+        parse_sharing(&stdout)
+    }
+
+    /// Invites `emails` to the node at `path` as `role`, and gives back
+    /// the sharing as it then stands.
+    pub async fn invite(
+        self,
+        path: String,
+        emails: Vec<String>,
+        role: Role,
+    ) -> Result<Option<Sharing>, Error> {
+        let mut args: Vec<OsString> = ["sharing", "invite", "--json", "--role", role.as_str()]
+            .map(OsString::from)
+            .into();
+        for email in &emails {
+            args.push("--user".into());
+            args.push(email.into());
+        }
+        args.push("--".into());
+        args.push(path.into());
+
+        let stdout = self.run(args).await?;
+        parse_sharing(&stdout)
+    }
+
+    /// Takes `emails`' access, or their pending invitations, away.
+    pub async fn unshare(
+        self,
+        path: String,
+        emails: Vec<String>,
+    ) -> Result<Option<Sharing>, Error> {
+        let mut args: Vec<OsString> = ["sharing", "remove", "--json"].map(OsString::from).into();
+        for email in &emails {
+            args.push("--email".into());
+            args.push(email.into());
+        }
+        args.push("--".into());
+        args.push(path.into());
+
+        let stdout = self.run(args).await?;
+        parse_sharing(&stdout)
+    }
+
+    /// Creates the node's public link, or sets its role.
+    pub async fn set_link(self, path: String, role: Role) -> Result<Option<Sharing>, Error> {
+        let stdout = self
+            .run([
+                "sharing",
+                "set-url",
+                "--json",
+                "--role",
+                role.as_str(),
+                "--",
+                &path,
+            ])
+            .await?;
+        parse_sharing(&stdout)
+    }
+
+    /// Removes the node's public link; members keep their access.
+    pub async fn remove_link(self, path: String) -> Result<Option<Sharing>, Error> {
+        let stdout = self
+            .run(["sharing", "remove-url", "--json", "--", &path])
+            .await?;
+        parse_sharing(&stdout)
+    }
+
+    /// Leaves a node shared with the account.
+    pub async fn leave(self, path: String) -> Result<(), Error> {
+        self.run(["sharing", "leave", "--json", "--", &path])
+            .await
+            .map(|_| ())
+    }
+
     /// Moves `entries` to the trash.
     pub async fn trash(self, entries: Vec<Entry>) -> Result<Done, Error> {
         let paths = entries.iter().map(|entry| entry.path.clone()).collect();
@@ -593,6 +673,140 @@ fn parse_json<T: serde::de::DeserializeOwned>(stdout: &str) -> Result<T, Error> 
     let start = stdout.find(['[', '{']).unwrap_or(0);
 
     serde_json::from_str(&stdout[start..]).map_err(|error| Error::Parse(error.to_string()))
+}
+
+/// What a member of a share, or the public, may do — the SDK's
+/// `MemberRole`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Role {
+    Viewer,
+    Editor,
+    Admin,
+}
+
+impl Role {
+    pub const ALL: [Role; 3] = [Role::Viewer, Role::Editor, Role::Admin];
+
+    /// The CLI's word for it.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Role::Viewer => "viewer",
+            Role::Editor => "editor",
+            Role::Admin => "admin",
+        }
+    }
+
+    /// What it allows, as Proton Drive words it.
+    pub fn label(self) -> &'static str {
+        match self {
+            Role::Viewer => "Viewer",
+            Role::Editor => "Editor",
+            Role::Admin => "Admin",
+        }
+    }
+
+    fn parse(word: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|role| role.as_str() == word)
+    }
+}
+
+impl std::fmt::Display for Role {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.label())
+    }
+}
+
+/// A node's sharing — the SDK's `ShareResult`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Sharing {
+    pub members: Vec<Member>,
+    pub link: Option<Link>,
+}
+
+/// Someone a node is shared with, or invited to; `pending` until they
+/// accept.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Member {
+    pub email: String,
+    pub role: Role,
+    pub pending: bool,
+}
+
+/// A node's public link.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Link {
+    pub url: String,
+    pub role: Role,
+    pub has_password: bool,
+    /// RFC 3339.
+    pub expires: Option<String>,
+    pub downloads: u64,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ShareResult {
+    #[serde(default)]
+    members: Vec<MemberJson>,
+    #[serde(default)]
+    proton_invitations: Vec<MemberJson>,
+    #[serde(default)]
+    non_proton_invitations: Vec<MemberJson>,
+    url_access: Option<UrlAccess>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct MemberJson {
+    invitee_email: String,
+    role: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct UrlAccess {
+    url: String,
+    role: String,
+    custom_password: Option<String>,
+    expiration_time: Option<String>,
+    #[serde(default)]
+    number_of_initialized_downloads: u64,
+}
+
+/// The sharing a `sharing` command prints: `undefined` for a node that is
+/// not shared, else the SDK's `ShareResult`.
+fn parse_sharing(stdout: &str) -> Result<Option<Sharing>, Error> {
+    let text = stdout.trim();
+    if text.is_empty() || text == "undefined" || text == "null" {
+        return Ok(None);
+    }
+
+    let result: ShareResult = parse_json(text)?;
+    let member = |pending: bool| {
+        move |member: MemberJson| Member {
+            email: member.invitee_email,
+            role: Role::parse(&member.role).unwrap_or(Role::Viewer),
+            pending,
+        }
+    };
+    let members = result
+        .members
+        .into_iter()
+        .map(member(false))
+        .chain(result.proton_invitations.into_iter().map(member(true)))
+        .chain(result.non_proton_invitations.into_iter().map(member(true)))
+        .collect();
+    let link = result.url_access.map(|access| Link {
+        url: access.url,
+        role: Role::parse(&access.role).unwrap_or(Role::Viewer),
+        has_password: access
+            .custom_password
+            .is_some_and(|password| !password.is_empty()),
+        expires: access.expiration_time,
+        downloads: access.number_of_initialized_downloads,
+    });
+
+    Ok(Some(Sharing { members, link }))
 }
 
 /// How an operation over nodes went: how many it took, and which it did
@@ -1086,6 +1300,26 @@ mod tests {
         let details = Details::from(parse_json::<NodeInfo>(json).unwrap());
         assert_eq!(details.created_by, None);
         assert_eq!(details.size, Some(5));
+    }
+
+    #[test]
+    fn sharing_is_read_from_status() {
+        assert_eq!(parse_sharing("undefined\n").unwrap(), None);
+
+        let json = r#"{"protonInvitations":[{"uid":"i","inviteeEmail":"bob@proton.me","role":"editor","invitationTime":"2026-01-01T00:00:00.000Z","addedByEmail":{"ok":true,"value":"me@proton.me"}}],
+            "nonProtonInvitations":[],"members":[{"uid":"m","inviteeEmail":"ann@proton.me","role":"viewer","invitationTime":"2026-01-01T00:00:00.000Z","addedByEmail":{"ok":true,"value":"me@proton.me"}}],
+            "urlAccess":{"uid":"u","creationTime":"2026-01-01T00:00:00.000Z","role":"viewer","url":"https://drive.proton.me/urls/x#y","numberOfInitializedDownloads":3},"editorsCanShare":false}"#;
+        let sharing = parse_sharing(json).unwrap().unwrap();
+
+        assert_eq!(sharing.members.len(), 2);
+        assert_eq!(sharing.members[0].email, "ann@proton.me");
+        assert!(!sharing.members[0].pending);
+        assert_eq!(sharing.members[1].role, Role::Editor);
+        assert!(sharing.members[1].pending);
+        let link = sharing.link.unwrap();
+        assert_eq!(link.url, "https://drive.proton.me/urls/x#y");
+        assert!(!link.has_password);
+        assert_eq!(link.downloads, 3);
     }
 
     #[test]

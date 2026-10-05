@@ -5,8 +5,8 @@ use iced::{Alignment, Fill};
 use libadwaita_iced::widget::about_dialog;
 use libadwaita_iced::widget::view_switcher::page;
 use libadwaita_iced::widget::{
-    action_row, button_row, entry_row, preferences_dialog, preferences_group, preferences_page,
-    spinner,
+    action_row, button_row, combo_row, entry_row, preferences_dialog, preferences_group,
+    preferences_page, spinner, switch_row,
 };
 use libadwaita_iced::widget::{
     alert_dialog, header_bar, icon, response, shortcuts_dialog, shortcuts_item, shortcuts_section,
@@ -14,8 +14,9 @@ use libadwaita_iced::widget::{
 };
 use libadwaita_iced::{Element, Widget, icons, typography, widget as adw};
 
+use super::looks_like_email;
 use super::{App, Dialog, Message};
-use crate::drive::{self, Kind, Source};
+use crate::drive::{self, Kind, Role, Source};
 use crate::{files, format};
 
 /// The naming dialog's entry, focused as the dialog opens.
@@ -32,6 +33,7 @@ impl App {
             Dialog::Shortcuts => shortcuts(),
             Dialog::Info => self.info(),
             Dialog::Delete => self.delete_alert(),
+            Dialog::Share => self.share(),
         }
     }
 
@@ -201,6 +203,109 @@ impl App {
             .response(response("Cancel", Message::CloseDialog).default_response())
             .response(response("Delete", Message::DeleteForever).destructive())
             .boxed()
+    }
+
+    /// Proton Drive's Share dialog as preference groups: the people the
+    /// item is shared with, each with their role and a way out, an
+    /// invitation to write, and the public link.
+    fn share(&self) -> Element<'_, Message> {
+        let Some(share) = &self.share else {
+            return iced::widget::space().boxed();
+        };
+
+        let mut people = preferences_group().title("People");
+        let mut link = preferences_group().title("Link");
+
+        match &share.sharing {
+            None => {
+                people = people.push(action_row("Loading").suffix(spinner()));
+            }
+            Some(Err(error)) => {
+                people = people.push(info_row("Could Not Read the Sharing", error.clone()));
+            }
+            Some(Ok(sharing)) => {
+                let can_send = looks_like_email(share.email.trim()) && !share.busy;
+                people = people
+                    .push(
+                        entry_row("Email address", &share.email)
+                            .on_input(Message::ShareEmail)
+                            .on_submit(Message::Invite)
+                            .on_apply(can_send.then_some(Message::Invite)),
+                    )
+                    .push(
+                        combo_row("Invite as", Some(share.role), Role::ALL, |role| {
+                            role.label().to_owned()
+                        })
+                        .on_select(Message::ShareRole),
+                    );
+
+                let members = sharing
+                    .as_ref()
+                    .map(|sharing| sharing.members.as_slice())
+                    .unwrap_or_default();
+                for member in members {
+                    let subtitle = if member.pending {
+                        format!("{} · Invited", member.role)
+                    } else {
+                        member.role.label().to_owned()
+                    };
+                    let remove = adw::icon_button(icons::user_trash())
+                        .style(adw::button::flat)
+                        .on_press_maybe(
+                            (!share.busy).then(|| Message::Uninvite(member.email.clone())),
+                        );
+                    people = people.push(
+                        action_row(member.email.as_str())
+                            .subtitle(subtitle)
+                            .suffix(remove),
+                    );
+                }
+
+                let public = sharing.as_ref().and_then(|sharing| sharing.link.as_ref());
+                link = link.push(
+                    switch_row("Share via Link", public.is_some())
+                        .subtitle("Anyone with the link")
+                        .on_toggle(Message::LinkToggled),
+                );
+                if let Some(public) = public {
+                    let copy = adw::icon_button(icons::edit_copy())
+                        .style(adw::button::flat)
+                        .on_press(Message::CopyText(public.url.clone()));
+                    let mut about = vec![format!("{} downloads", public.downloads)];
+                    if public.has_password {
+                        about.push("Password".to_owned());
+                    }
+                    if let Some(expires) = public.expires.as_deref().and_then(format::full_date) {
+                        about.push(format!("Expires {expires}"));
+                    }
+                    link = link
+                        .push(
+                            action_row(public.url.as_str())
+                                .subtitle(about.join(" · "))
+                                .suffix(copy),
+                        )
+                        .push(
+                            combo_row(
+                                "Anyone with the link is",
+                                Some(public.role),
+                                [Role::Viewer, Role::Editor],
+                                |role| role.label().to_owned(),
+                            )
+                            .on_select(Message::LinkRole),
+                        );
+                }
+            }
+        }
+
+        let page = adw::scrollable(column![people, link].spacing(24).padding([24, 18]));
+        let mut bar = header_bar()
+            .title(window_title("Share").subtitle(share.entry.name.as_str()))
+            .on_close(Message::CloseDialog);
+        if share.busy {
+            bar = bar.end(spinner());
+        }
+
+        toolbar_view(page).top(bar).width(480).height(600).boxed()
     }
 
     /// What there is to know of one item: its icon and name over the
