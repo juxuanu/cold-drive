@@ -40,11 +40,18 @@ const TILE_WIDTH: f32 = 128.0;
 const CLI_DOWNLOAD: &str = "https://proton.me/download/drive/cli/index.html";
 
 /// An operation under way — Files' `NautilusProgressInfo`: what it is,
-/// and a detail line under it.
+/// a detail line under it, and the task it runs as, whose CLI child dies
+/// with it when it is cancelled.
 struct Operation {
     id: u64,
     status: String,
     details: String,
+    /// The folder's page, listed again once the operation is cancelled.
+    tag: String,
+    /// Whether the folder counts it among its transfers.
+    transfer: bool,
+    /// Aborts the task once dropped; `None` until the task is made.
+    handle: Option<iced::task::Handle>,
 }
 
 pub struct App {
@@ -238,6 +245,8 @@ pub enum Message {
     /// An item opened: a double click or Enter on it, by its index among
     /// those shown.
     Activated(String, usize),
+    /// Cancel the operation, from its row in the popover.
+    CancelOperation(u64),
     /// Escape, outside a dialog: whatever is up first goes.
     Escape,
     Download(String),
@@ -460,6 +469,22 @@ impl App {
                     return Task::none();
                 };
                 return self.activate(&tag, &uid);
+            }
+            Message::CancelOperation(id) => {
+                let Some(at) = self.operations.iter().position(|op| op.id == id) else {
+                    return Task::none();
+                };
+                // Dropping the operation aborts its task, and the CLI with it.
+                let operation = self.operations.remove(at);
+                tracing::info!(status = %operation.status, "cancelled");
+
+                if operation.transfer
+                    && let Some(folder) = self.folder_mut(&operation.tag)
+                {
+                    folder.transfers = folder.transfers.saturating_sub(1);
+                }
+                // Whatever was done before the kill shows.
+                return self.load(&operation.tag);
             }
             Message::Escape => {
                 // A dialog takes its own Escape; so does an open menu.
@@ -1027,16 +1052,29 @@ impl App {
         }
     }
 
-    /// Registers an operation under way, for the indicator.
-    fn begin(&mut self, status: String, details: String) -> u64 {
+    /// Registers an operation under way in the folder at `tag`, for the
+    /// indicator; `track` then hands it its task.
+    fn begin(&mut self, status: String, details: String, tag: &str, transfer: bool) -> u64 {
         let id = self.next_operation;
         self.next_operation += 1;
         self.operations.push(Operation {
             id,
             status,
             details,
+            tag: tag.to_owned(),
+            transfer,
+            handle: None,
         });
         id
+    }
+
+    /// Makes the operation's task one its row can cancel.
+    fn track(&mut self, id: u64, task: Task<Message>) -> Task<Message> {
+        let (task, handle) = task.abortable();
+        if let Some(operation) = self.operations.iter_mut().find(|op| op.id == id) {
+            operation.handle = Some(handle.abort_on_drop());
+        }
+        task
     }
 
     fn finish(&mut self, id: u64) {
@@ -1064,12 +1102,13 @@ impl App {
             1 => "Downloading 1 item".to_owned(),
             count => format!("Downloading {count} items"),
         };
-        let operation = self.begin(short, format!("To {}", dir.display()));
+        let operation = self.begin(short, format!("To {}", dir.display()), tag, true);
 
         let tag = tag.to_owned();
-        Task::perform(cli.download_to(paths, dir), move |result| {
+        let task = Task::perform(cli.download_to(paths, dir), move |result| {
             Message::Downloaded(operation, tag.clone(), result)
-        })
+        });
+        self.track(operation, task)
     }
 
     /// The folder on top of the stack, if files and folders can go in it.
@@ -1109,13 +1148,14 @@ impl App {
             [name] => format!("Uploading “{name}”"),
             names => format!("Uploading {} files", names.len()),
         };
-        let operation = self.begin(short, format!("To {into}"));
+        let operation = self.begin(short, format!("To {into}"), tag, true);
 
         // The spinner in the header bar shows it is under way.
         let tag = tag.to_owned();
-        Task::perform(cli.upload(files, parent), move |result| {
+        let task = Task::perform(cli.upload(files, parent), move |result| {
             Message::Uploaded(operation, tag.clone(), names.clone(), result)
-        })
+        });
+        self.track(operation, task)
     }
 
     fn uploaded(
@@ -1194,18 +1234,26 @@ impl App {
                 let operation = self.begin(
                     format!("Renaming “{old}” to “{name}”"),
                     format!("In {into}"),
+                    &tag,
+                    false,
                 );
-                Task::perform(cli.rename(entry.path, name.clone()), move |result| {
+                let task = Task::perform(cli.rename(entry.path, name.clone()), move |result| {
                     Message::Renamed(operation, tag.clone(), old.clone(), name.clone(), result)
-                })
+                });
+                self.track(operation, task)
             }
             None => {
                 tracing::info!(%name, %parent, "creating a folder");
-                let operation =
-                    self.begin(format!("Creating folder “{name}”"), format!("In {into}"));
-                Task::perform(cli.create_folder(parent, name.clone()), move |result| {
+                let operation = self.begin(
+                    format!("Creating folder “{name}”"),
+                    format!("In {into}"),
+                    &tag,
+                    false,
+                );
+                let task = Task::perform(cli.create_folder(parent, name.clone()), move |result| {
                     Message::FolderCreated(operation, tag.clone(), name.clone(), result)
-                })
+                });
+                self.track(operation, task)
             }
         }
     }
@@ -1393,36 +1441,55 @@ impl App {
 
     /// The operations indicator, after Files' `NautilusProgressIndicator`:
     /// a flat button with a spinner while something runs, beside the `+`,
-    /// opening a popover with each operation's status and details. `None`
+    /// opening a popover of the operations, each as Files'
+    /// `NautilusProgressInfoWidget` lays it: the status over a pulsing bar
+    /// over the details, a circular cancel button beside them. `None`
     /// while nothing runs.
     fn operations_indicator(&self) -> Option<Element<'_, Message>> {
-        use libadwaita_iced::widget::popover_menu::heading;
+        use libadwaita_iced::widget::{popover_button, progress_bar};
 
         if self.operations.is_empty() {
             return None;
         }
 
-        // Each operation: its status as a heading, its details as the
-        // dimmed line under it, as the popover's rows read.
-        let entries = self
-            .operations
-            .iter()
-            .enumerate()
-            .flat_map(|(index, operation)| {
-                let mut entries = Vec::new();
-                if index > 0 {
-                    entries.push(separator());
-                }
-                entries.push(heading(operation.status.clone()));
-                entries.push(item(operation.details.clone()).into());
-                entries
-            });
+        let rows = self.operations.iter().map(|operation| {
+            let text = column![
+                typography::label(operation.status.as_str())
+                    .wrapping(text::Wrapping::None)
+                    .ellipsis(text::Ellipsis::Middle),
+                container(progress_bar::pulsing()).padding([0.0, 2.0]),
+                typography::caption(operation.details.as_str()).style(adw::text::dimmed),
+            ]
+            .spacing(6)
+            .width(300);
+
+            row![
+                text,
+                container(
+                    adw::circular_button(icons::process_stop())
+                        .on_press(Message::CancelOperation(operation.id)),
+                )
+                .padding(iced::padding::left(20.0)),
+            ]
+            .align_y(Alignment::Center)
+            .boxed()
+        });
+        let list = iced::widget::Column::with_children(rows)
+            .spacing(12)
+            .padding(6);
+
+        // Files caps the list at 270px and scrolls past that.
+        let popover: Element<'_, Message> = if self.operations.len() > 3 {
+            adw::scrollable(list).height(270).boxed()
+        } else {
+            list.boxed()
+        };
 
         Some(
-            menu_button(spinner())
+            popover_button(spinner())
                 .style(adw::button::flat)
                 .image_button()
-                .extend(entries)
+                .popover(popover)
                 .boxed(),
         )
     }
