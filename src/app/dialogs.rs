@@ -31,6 +31,7 @@ impl App {
             Dialog::NewFolder => self.naming(),
             Dialog::Shortcuts => shortcuts(),
             Dialog::Info => self.info(),
+            Dialog::Delete => self.delete_alert(),
         }
     }
 
@@ -178,6 +179,27 @@ impl App {
                     .enabled(valid)
                     .default_response(),
             )
+            .boxed()
+    }
+
+    /// Files' alert before a permanent delete: the item, or the count,
+    /// in the heading, a Cancel that is the default, and a destructive
+    /// Delete.
+    fn delete_alert(&self) -> Element<'_, Message> {
+        let heading = match self
+            .deleting
+            .as_ref()
+            .map(|(_, entries)| entries.as_slice())
+        {
+            Some([entry]) => format!("Permanently Delete “{}”?", entry.name),
+            Some(entries) => format!("Permanently Delete {} Selected Items?", entries.len()),
+            None => "Permanently Delete?".to_owned(),
+        };
+
+        alert_dialog(heading)
+            .body("Permanently deleted items can't be restored")
+            .response(response("Cancel", Message::CloseDialog).default_response())
+            .response(response("Delete", Message::DeleteForever).destructive())
             .boxed()
     }
 
@@ -334,6 +356,10 @@ fn shortcuts() -> Element<'static, Message> {
                 .item(shortcuts_item("Upload Files", "<Control>u"))
                 .item(shortcuts_item("New Folder", "<Control>n"))
                 .item(shortcuts_item("Rename the Selected Item", "F2"))
+                .item(
+                    shortcuts_item("Move the Selection to Trash", "Delete")
+                        .subtitle("In the Trash, deletes it permanently"),
+                )
                 .item(shortcuts_item("Refresh", "F5 <Control>r"))
                 .item(shortcuts_item("Select All", "<Control>a"))
                 .item(shortcuts_item(

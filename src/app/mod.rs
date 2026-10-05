@@ -27,7 +27,7 @@ use libadwaita_iced::{
 };
 
 use crate::config::{Config, View};
-use crate::drive::{self, Account, Cli, Details, Entry, Kind, Login, Transfer};
+use crate::drive::{self, Account, Cli, Details, Done, Entry, Kind, Login, Transfer};
 use crate::files::{self, Class, Content, Document, Opened};
 use crate::format;
 
@@ -85,6 +85,8 @@ pub struct App {
     account: Option<Result<Account, String>>,
     about_pages: Vec<AboutPage>,
     naming: Option<Naming>,
+    /// What the Delete alert is about: the page, and the items.
+    deleting: Option<(String, Vec<Entry>)>,
     info: Option<Info>,
 }
 
@@ -104,6 +106,8 @@ pub enum Dialog {
     NewFolder,
     Shortcuts,
     Info,
+    /// Files' "Permanently Delete…?" alert.
+    Delete,
 }
 
 /// The folder being named in the New Folder dialog.
@@ -247,6 +251,18 @@ pub enum Message {
     Activated(String, usize),
     /// Cancel the operation, from its row in the popover.
     CancelOperation(u64),
+    /// Move the selection on the page to the trash.
+    Trash(String),
+    Trashed(u64, String, Vec<Entry>, Result<Done, drive::Error>),
+    /// Restore the items from the trash: the menu in the trash, or Undo.
+    Restore(String, Vec<Entry>),
+    Restored(u64, String, Vec<Entry>, Result<Done, drive::Error>),
+    /// Ask before deleting the selection on the page for good.
+    ConfirmDelete(String),
+    DeleteForever,
+    Deleted(u64, String, Vec<Entry>, Result<Done, drive::Error>),
+    /// Delete: the trash on a folder page, for good in the trash.
+    DeleteSelected,
     /// Escape, outside a dialog: whatever is up first goes.
     Escape,
     Download(String),
@@ -329,6 +345,7 @@ impl App {
             account: None,
             about_pages: Vec::new(),
             naming: None,
+            deleting: None,
             operations: Vec::new(),
             next_operation: 0,
             info: None,
@@ -367,6 +384,7 @@ impl App {
                     Key::Character("u") if modifiers.command() => Some(Message::UploadHere),
                     Key::Character("n") if modifiers.command() => Some(Message::NewFolderHere),
                     Key::Named(Named::F2) => Some(Message::RenameSelected),
+                    Key::Named(Named::Delete) => Some(Message::DeleteSelected),
                     Key::Character(",") if modifiers.command() => {
                         Some(Message::ShowDialog(Dialog::Preferences))
                     }
@@ -485,6 +503,147 @@ impl App {
                 }
                 // Whatever was done before the kill shows.
                 return self.load(&operation.tag);
+            }
+            Message::DeleteSelected => {
+                let Some((tag, writable)) = self.top_folder() else {
+                    return Task::none();
+                };
+                if self.section == Section::Trash {
+                    return self.update(Message::ConfirmDelete(tag));
+                }
+                if writable {
+                    return self.update(Message::Trash(tag));
+                }
+            }
+            Message::Trash(tag) => {
+                let Some(cli) = self.cli.clone() else {
+                    return Task::none();
+                };
+                let Some((entries, from)) = self
+                    .folder_mut(&tag)
+                    .map(|folder| {
+                        (
+                            folder
+                                .selected_entries()
+                                .into_iter()
+                                .cloned()
+                                .collect::<Vec<_>>(),
+                            folder.title.clone(),
+                        )
+                    })
+                    .filter(|(entries, _)| !entries.is_empty())
+                else {
+                    return Task::none();
+                };
+
+                let operation = self.begin(
+                    format!("Moving {} to Trash", describe(&entries)),
+                    format!("From {from}"),
+                    &tag,
+                    false,
+                );
+                tracing::info!(count = entries.len(), "trashing");
+                let task = Task::perform(cli.trash(entries.clone()), {
+                    let tag = tag.clone();
+                    move |result| Message::Trashed(operation, tag.clone(), entries.clone(), result)
+                });
+                return self.track(operation, task);
+            }
+            Message::Trashed(operation, tag, entries, result) => {
+                self.finish(operation);
+                match result {
+                    Ok(done) if done.failed.is_empty() => {
+                        tracing::info!(count = done.done, "trashed");
+                        // Undone by restoring, as Files' toast offers.
+                        self.toasts.add(
+                            toast::toast(format!("{} moved to Trash", describe(&entries)))
+                                .button("Undo", Message::Restore(tag.clone(), entries)),
+                        );
+                    }
+                    Ok(done) => self.toast(failed("move", "to Trash", &done)),
+                    Err(drive::Error::AuthRequired) => self.signed_out = true,
+                    Err(error) => self.toast(format!("Could not move to Trash: {error}")),
+                }
+                return self.load(&tag);
+            }
+            Message::Restore(tag, entries) => {
+                let Some(cli) = self.cli.clone() else {
+                    return Task::none();
+                };
+                let operation = self.begin(
+                    format!("Restoring {}", describe(&entries)),
+                    "From Trash".to_owned(),
+                    &tag,
+                    false,
+                );
+                tracing::info!(count = entries.len(), "restoring");
+                let task = Task::perform(cli.restore(entries.clone()), {
+                    let tag = tag.clone();
+                    move |result| Message::Restored(operation, tag.clone(), entries.clone(), result)
+                });
+                return self.track(operation, task);
+            }
+            Message::Restored(operation, tag, entries, result) => {
+                self.finish(operation);
+                match result {
+                    Ok(done) if done.failed.is_empty() => {
+                        tracing::info!(count = done.done, "restored");
+                        if let Some(folder) = self.folder_mut(&tag) {
+                            folder.select_next =
+                                entries.into_iter().map(|entry| entry.name).collect();
+                        }
+                    }
+                    Ok(done) => self.toast(failed("restore", "", &done)),
+                    Err(drive::Error::AuthRequired) => self.signed_out = true,
+                    Err(error) => self.toast(format!("Could not restore: {error}")),
+                }
+                return self.load(&tag);
+            }
+            Message::ConfirmDelete(tag) => {
+                let entries: Vec<Entry> = self
+                    .folder_mut(&tag)
+                    .map(|folder| folder.selected_entries().into_iter().cloned().collect())
+                    .unwrap_or_default();
+                if entries.is_empty() {
+                    return Task::none();
+                }
+                self.deleting = Some((tag, entries));
+                self.dialog = Some(Dialog::Delete);
+                self.dialog_open = true;
+            }
+            Message::DeleteForever => {
+                let Some(cli) = self.cli.clone() else {
+                    return Task::none();
+                };
+                let Some((tag, entries)) = self.deleting.take() else {
+                    return Task::none();
+                };
+                self.dialog_open = false;
+
+                let operation = self.begin(
+                    format!("Deleting {}", describe(&entries)),
+                    "From Trash, permanently".to_owned(),
+                    &tag,
+                    false,
+                );
+                tracing::info!(count = entries.len(), "deleting for good");
+                let task = Task::perform(cli.delete(entries.clone()), {
+                    let tag = tag.clone();
+                    move |result| Message::Deleted(operation, tag.clone(), entries.clone(), result)
+                });
+                return self.track(operation, task);
+            }
+            Message::Deleted(operation, tag, _entries, result) => {
+                self.finish(operation);
+                match result {
+                    Ok(done) if done.failed.is_empty() => {
+                        tracing::info!(count = done.done, "deleted");
+                    }
+                    Ok(done) => self.toast(failed("delete", "", &done)),
+                    Err(drive::Error::AuthRequired) => self.signed_out = true,
+                    Err(error) => self.toast(format!("Could not delete: {error}")),
+                }
+                return self.load(&tag);
             }
             Message::Escape => {
                 // A dialog takes its own Escape; so does an open menu.
@@ -694,6 +853,7 @@ impl App {
                 self.dialog = None;
                 self.naming = None;
                 self.info = None;
+                self.deleting = None;
             }
             Message::CliPathInput(path) => self.cli_path_input = path,
             Message::ApplyCliPath => return self.apply_cli_path(),
@@ -1109,6 +1269,14 @@ impl App {
             Message::Downloaded(operation, tag.clone(), result)
         });
         self.track(operation, task)
+    }
+
+    /// The folder on top of the stack, and whether things can go in it.
+    fn top_folder(&self) -> Option<(String, bool)> {
+        self.live_pages().last().and_then(|page| match &page.kind {
+            PageKind::Folder(folder) => Some((page.tag.clone(), folder.writable)),
+            _ => None,
+        })
     }
 
     /// The folder on top of the stack, if files and folders can go in it.
@@ -1772,12 +1940,41 @@ impl App {
             count => format!("Download {count} Files…"),
         };
 
-        let mut entries = vec![
-            item(download)
-                .on_activate(Message::Download(tag.to_owned()))
-                .into(),
-        ];
-        if let Some(entry) = shown.get(index) {
+        let Some(entry) = shown.get(index) else {
+            return Vec::new();
+        };
+        let mut entries: Vec<MenuEntry<Message>> = Vec::new();
+
+        if self.section == Section::Trash {
+            // What the trash's items can have done, as Files offers it:
+            // the CLI neither downloads nor renames them.
+            let restore: Vec<Entry> = if selection.is_selected(index) {
+                shown
+                    .iter()
+                    .enumerate()
+                    .filter(|(at, _)| selection.is_selected(*at))
+                    .map(|(_, entry)| (*entry).clone())
+                    .collect()
+            } else {
+                vec![(*entry).clone()]
+            };
+            entries.push(
+                item("Restore")
+                    .on_activate(Message::Restore(tag.to_owned(), restore))
+                    .into(),
+            );
+            entries.push(
+                item("Delete Permanently…")
+                    .accelerator("Delete")
+                    .on_activate(Message::ConfirmDelete(tag.to_owned()))
+                    .into(),
+            );
+        } else {
+            entries.push(
+                item(download)
+                    .on_activate(Message::Download(tag.to_owned()))
+                    .into(),
+            );
             // One item is renamed; Files' batch rename is not here.
             if count == 1 {
                 entries.push(
@@ -1787,12 +1984,21 @@ impl App {
                         .into(),
                 );
             }
+            entries.push(separator());
             entries.push(
-                item("Info")
-                    .on_activate(Message::ShowInfo(tag.to_owned(), entry.uid.clone()))
+                item("Move to Trash")
+                    .accelerator("Delete")
+                    .on_activate(Message::Trash(tag.to_owned()))
                     .into(),
             );
         }
+
+        entries.push(separator());
+        entries.push(
+            item("Info")
+                .on_activate(Message::ShowInfo(tag.to_owned(), entry.uid.clone()))
+                .into(),
+        );
         entries
     }
 
@@ -2060,6 +2266,29 @@ fn on_view<'a>(page: impl Widget<Message> + 'a) -> Element<'a, Message> {
         .width(Fill)
         .height(Fill)
         .boxed()
+}
+
+/// `entries` as a toast or an operation names them: the one by name, more
+/// by their count.
+fn describe(entries: &[Entry]) -> String {
+    match entries {
+        [entry] => format!("“{}”", entry.name),
+        entries => format!("{} items", entries.len()),
+    }
+}
+
+/// The toast for a node operation that failed some of its items.
+fn failed(verb: &str, where_to: &str, done: &Done) -> String {
+    let to = if where_to.is_empty() {
+        String::new()
+    } else {
+        format!(" {where_to}")
+    };
+    match done.failed.as_slice() {
+        [(name, Some(reason))] => format!("Could not {verb} “{name}”{to}: {reason}"),
+        [(name, None)] => format!("Could not {verb} “{name}”{to}"),
+        failed => format!("Could not {verb} {} items{to}", failed.len()),
+    }
 }
 
 /// The id of a folder page's list or grid, to scroll it by.

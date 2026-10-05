@@ -109,6 +109,11 @@ pub enum Kind {
 }
 
 impl Entry {
+    /// Where the entry is addressed once in the trash.
+    pub fn trash_path(&self) -> String {
+        trash_path(&self.name)
+    }
+
     pub fn is_folder(&self) -> bool {
         matches!(self.kind, Kind::Folder | Kind::Device)
     }
@@ -261,6 +266,61 @@ impl Cli {
         }
 
         Err(Error::Failed("The download finished without a file".into()))
+    }
+
+    /// Moves `entries` to the trash.
+    pub async fn trash(self, entries: Vec<Entry>) -> Result<Done, Error> {
+        let paths = entries.iter().map(|entry| entry.path.clone()).collect();
+        self.node_op("trash", paths, &entries).await
+    }
+
+    /// Restores `entries` from the trash.
+    pub async fn restore(self, entries: Vec<Entry>) -> Result<Done, Error> {
+        let paths = entries.iter().map(Entry::trash_path).collect();
+        self.node_op("restore", paths, &entries).await
+    }
+
+    /// Deletes `entries`, which are in the trash, for good.
+    pub async fn delete(self, entries: Vec<Entry>) -> Result<Done, Error> {
+        let paths = entries.iter().map(Entry::trash_path).collect();
+        self.node_op("delete", paths, &entries).await
+    }
+
+    /// Runs `filesystem <command>` over `paths`, and reads the result it
+    /// prints for each node, named after `entries`.
+    async fn node_op(
+        &self,
+        command: &str,
+        paths: Vec<String>,
+        entries: &[Entry],
+    ) -> Result<Done, Error> {
+        let mut args: Vec<OsString> = ["filesystem", command, "--json", "--"]
+            .map(OsString::from)
+            .into();
+        args.extend(paths.into_iter().map(OsString::from));
+
+        let stdout = self.run(args).await?;
+        let results: Vec<NodeResult> = parse_json(&stdout)?;
+
+        let name_of = |uid: &str| {
+            entries
+                .iter()
+                .find(|entry| entry.uid == uid)
+                .map_or_else(|| uid.to_owned(), |entry| entry.name.clone())
+        };
+        let mut done = Done::default();
+        for result in results {
+            if result.ok {
+                done.done += 1;
+            } else {
+                let reason = result
+                    .error
+                    .as_ref()
+                    .and_then(|error| error.get("message")?.as_str().map(str::to_owned));
+                done.failed.push((name_of(&result.uid), reason));
+            }
+        }
+        Ok(done)
     }
 
     /// Renames the node at `path` to `name`, where it is.
@@ -533,6 +593,22 @@ fn parse_json<T: serde::de::DeserializeOwned>(stdout: &str) -> Result<T, Error> 
     let start = stdout.find(['[', '{']).unwrap_or(0);
 
     serde_json::from_str(&stdout[start..]).map_err(|error| Error::Parse(error.to_string()))
+}
+
+/// How an operation over nodes went: how many it took, and which it did
+/// not, with why when the CLI says.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Done {
+    pub done: usize,
+    pub failed: Vec<(String, Option<String>)>,
+}
+
+/// What `trash`, `restore` and `delete` print for each node.
+#[derive(Debug, Deserialize)]
+struct NodeResult {
+    uid: String,
+    ok: bool,
+    error: Option<serde_json::Value>,
 }
 
 /// How an upload or a download went.
@@ -818,6 +894,11 @@ fn entry(item: serde_json::Value, parent: &str) -> Option<Entry> {
 /// How the CLI is to find a node: by its UID when it has the shape the CLI
 /// recognises, else by name under its parent.
 fn node_path(uid: &str, parent: &str, name: &str) -> String {
+    // `restore` and `delete` take trashed items by name under `/trash`
+    // only, so that is how the trash's items are addressed.
+    if parent.trim_end_matches('/') == "/trash" {
+        return trash_path(name);
+    }
     if is_node_uid(uid) {
         format!("/my-files/{uid}")
     } else {
@@ -827,6 +908,12 @@ fn node_path(uid: &str, parent: &str, name: &str) -> String {
             name.replace('/', "\\/")
         )
     }
+}
+
+/// Where a trashed item is addressed: `/trash/<name>`, `/` in the name
+/// escaped as the CLI reads it.
+fn trash_path(name: &str) -> String {
+    format!("/trash/{}", name.replace('/', "\\/"))
 }
 
 /// The CLI's `isNodeUid`: two IDs joined by `~`, each 22 URL-safe base64
@@ -999,6 +1086,15 @@ mod tests {
         let details = Details::from(parse_json::<NodeInfo>(json).unwrap());
         assert_eq!(details.created_by, None);
         assert_eq!(details.size, Some(5));
+    }
+
+    #[test]
+    fn trashed_items_are_addressed_by_name() {
+        let item = serde_json::json!({"uid": UID, "name": {"ok": true, "value": "a/b.txt"}, "type": "file"});
+        let entry = entry(item, "/trash").unwrap();
+
+        assert_eq!(entry.path, "/trash/a\\/b.txt");
+        assert_eq!(entry.trash_path(), "/trash/a\\/b.txt");
     }
 
     #[test]
