@@ -329,7 +329,16 @@ fn shortcuts() -> Element<'static, Message> {
                 .item(shortcuts_item("Upload Files", "<Control>u"))
                 .item(shortcuts_item("New Folder", "<Control>n"))
                 .item(shortcuts_item("Refresh", "F5 <Control>r"))
-                .item(shortcuts_item("Clear the Selection", "Escape")),
+                .item(shortcuts_item("Select All", "<Control>a"))
+                .item(shortcuts_item(
+                    "Clear the Selection",
+                    "<Shift><Control>a Escape",
+                ))
+                .item(
+                    shortcuts_item("Move the Selection", "Up Down Home End Page_Up Page_Down")
+                        .subtitle("Ctrl moves alone, Shift extends"),
+                )
+                .item(shortcuts_item("Open the Selected Item", "Return")),
         )
         .section(
             shortcuts_section("Navigation")
