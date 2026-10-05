@@ -5,7 +5,7 @@ use std::path::PathBuf;
 
 use iced::keyboard::{self, Key, key::Named};
 use iced::theme::Mode;
-use iced::widget::{center, column, container, image, mouse_area, row, svg, text, text_editor};
+use iced::widget::{center, column, container, image, row, svg, text, text_editor};
 use iced::{Alignment, Fill, Font, Subscription, Task};
 use libadwaita_iced::widget::about_dialog::Page as AboutPage;
 use libadwaita_iced::widget::breakpoint_bin::{self, breakpoint_bin};
@@ -213,8 +213,6 @@ pub enum Message {
     /// An item opened: a double click or Enter on it, by its index among
     /// those shown.
     Activated(String, usize),
-    /// A press on a folder's empty space.
-    Deselect(String),
     /// Escape, outside a dialog: whatever is up first goes.
     Escape,
     Download(String),
@@ -421,11 +419,6 @@ impl App {
                     return Task::none();
                 };
                 return self.activate(&tag, &uid);
-            }
-            Message::Deselect(tag) => {
-                if let Some(folder) = self.folder_mut(&tag) {
-                    folder.selected = Selection::Multiple(Default::default());
-                }
             }
             Message::Escape => {
                 // A dialog takes its own Escape; so does an open menu.
@@ -1434,13 +1427,11 @@ impl App {
             }
         };
 
-        // A press that no item takes is on the folder itself.
-        mouse_area(adw::scrollable(
+        adw::scrollable(
             clamp(column![search, list].spacing(12).padding([24, 12]))
                 .maximum_size(860)
                 .tightening_threshold(600),
-        ))
-        .on_press(Message::Deselect(tag.to_owned()))
+        )
         .boxed()
     }
 
