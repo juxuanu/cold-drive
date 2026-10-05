@@ -14,6 +14,7 @@ use libadwaita_iced::widget::navigation_view::NavigationPage;
 use libadwaita_iced::widget::popover_menu::Entry as MenuEntry;
 use libadwaita_iced::widget::popover_menu::{item, menu_button, separator};
 use libadwaita_iced::widget::sidebar::{self, Mode as SidebarMode};
+use libadwaita_iced::widget::support::Surface;
 use libadwaita_iced::widget::toast::{self, Toasts};
 use libadwaita_iced::widget::{action_row as row_metrics, grid_view, list_view};
 use libadwaita_iced::widget::{
@@ -1379,10 +1380,12 @@ impl App {
         let _ = entries;
         let shown = folder.shown();
 
-        let search = search_entry("Search this folder", &folder.filter).on_input({
-            let tag = tag.to_owned();
-            move |filter| Message::Filtered(tag.clone(), filter)
-        });
+        let search = search_entry("Search this folder", &folder.filter)
+            .on_input({
+                let tag = tag.to_owned();
+                move |filter| Message::Filtered(tag.clone(), filter)
+            })
+            .surface(Surface::View);
 
         let list: Element<'_, Message> = if shown.is_empty() {
             status_page()
@@ -1436,11 +1439,17 @@ impl App {
             }
         };
 
-        adw::scrollable(
+        // The whole page is the view surface, as Files' is: the list paints
+        // `--view-bg-color` under its rows, and the rest of the page has to
+        // match, or the list shows as a tinted block on the window.
+        container(adw::scrollable(
             clamp(column![search, list].spacing(12).padding([24, 12]))
                 .maximum_size(860)
                 .tightening_threshold(600),
-        )
+        ))
+        .style(adw::container::view)
+        .width(Fill)
+        .height(Fill)
         .boxed()
     }
 
