@@ -16,7 +16,7 @@ use libadwaita_iced::widget::popover_menu::{item, menu_button, separator};
 use libadwaita_iced::widget::sidebar::{self, Mode as SidebarMode};
 use libadwaita_iced::widget::support::Surface;
 use libadwaita_iced::widget::toast::{self, Toasts};
-use libadwaita_iced::widget::{action_row as row_metrics, grid_view, list_view};
+use libadwaita_iced::widget::{action_row as row_metrics, grid_view, list_view, preferences_group};
 use libadwaita_iced::widget::{
     clamp, dialog, header_bar, icon, navigation_page, navigation_split_view, navigation_view,
     search_entry, spinner, status_page, toast_overlay, toolbar_view, window_title,
@@ -28,7 +28,7 @@ use libadwaita_iced::{
 
 use crate::config::{Config, View};
 use crate::drive::{
-    self, Account, Cli, Details, Done, Entry, Kind, Login, Role, Sharing, Transfer,
+    self, Account, Cli, Details, Done, Entry, Invitation, Kind, Login, Role, Sharing, Transfer,
 };
 use crate::files::{self, Class, Content, Document, Opened};
 use crate::format;
@@ -184,6 +184,8 @@ struct Folder {
     /// Names to select once the folder is next listed: what was just
     /// created or uploaded into it.
     select_next: Vec<String>,
+    /// The invitations waiting, on the Shared with Me page.
+    invitations: Vec<Invitation>,
     /// The entries selected, by their index among those shown — the
     /// view's selection, lent to it each frame.
     selected: Selection,
@@ -281,6 +283,15 @@ pub enum Message {
     DeleteSelected,
     /// Open the Share dialog on the item.
     ShareIn(String, String),
+    /// Leave the item shared with the account.
+    Leave(String, String),
+    Left(u64, String, String, Result<(), drive::Error>),
+    /// The invitations waiting, for the page.
+    Invitations(String, Result<Vec<Invitation>, drive::Error>),
+    AcceptInvitation(String, Invitation),
+    RejectInvitation(String, Invitation),
+    /// An invitation answered: the page, the item, and how it went.
+    InvitationAnswered(u64, String, String, Result<(), drive::Error>),
     /// The sharing as the CLI tells it, for the item by UID.
     ShareLoaded(String, Result<Option<Sharing>, drive::Error>),
     ShareEmail(String),
@@ -683,6 +694,112 @@ impl App {
                 return Task::perform(cli.set_link(path, role), move |result| {
                     Message::ShareLoaded(uid.clone(), result)
                 });
+            }
+            Message::Leave(tag, uid) => {
+                let Some(cli) = self.cli.clone() else {
+                    return Task::none();
+                };
+                let Some(entry) = self
+                    .folder_mut(&tag)
+                    .and_then(|folder| folder.entry(&uid).cloned())
+                else {
+                    return Task::none();
+                };
+                let operation = self.begin(
+                    format!("Leaving “{}”", entry.name),
+                    "Shared with you".to_owned(),
+                    &tag,
+                    false,
+                );
+                tracing::info!(name = %entry.name, "leaving");
+                let task = Task::perform(cli.leave(entry.path), {
+                    let tag = tag.clone();
+                    move |result| Message::Left(operation, tag.clone(), entry.name.clone(), result)
+                });
+                return self.track(operation, task);
+            }
+            Message::Left(operation, tag, name, result) => {
+                self.finish(operation);
+                match result {
+                    Ok(()) => tracing::info!(%name, "left"),
+                    Err(drive::Error::AuthRequired) => self.signed_out = true,
+                    Err(error) => self.toast(format!("Could not leave “{name}”: {error}")),
+                }
+                return self.load(&tag);
+            }
+            Message::Invitations(tag, result) => {
+                if let Some(folder) = self.folder_mut(&tag) {
+                    match result {
+                        Ok(invitations) => folder.invitations = invitations,
+                        Err(drive::Error::AuthRequired) => self.signed_out = true,
+                        Err(error) => tracing::warn!(%error, "no invitations"),
+                    }
+                }
+            }
+            Message::AcceptInvitation(tag, invitation)
+            | Message::RejectInvitation(tag, invitation)
+                if self.cli.is_none() =>
+            {
+                let _ = (tag, invitation);
+            }
+            Message::AcceptInvitation(tag, invitation) => {
+                let cli = self.cli.clone().expect("checked above");
+                let operation = self.begin(
+                    format!("Accepting “{}”", invitation.name),
+                    invitation
+                        .from
+                        .as_deref()
+                        .map_or("Shared with you".to_owned(), |from| format!("From {from}")),
+                    &tag,
+                    false,
+                );
+                tracing::info!(name = %invitation.name, "accepting an invitation");
+                let task = Task::perform(cli.accept_invitation(invitation.uid), {
+                    let tag = tag.clone();
+                    move |result| {
+                        Message::InvitationAnswered(
+                            operation,
+                            tag.clone(),
+                            invitation.name.clone(),
+                            result,
+                        )
+                    }
+                });
+                return self.track(operation, task);
+            }
+            Message::RejectInvitation(tag, invitation) => {
+                let cli = self.cli.clone().expect("checked above");
+                let operation = self.begin(
+                    format!("Declining “{}”", invitation.name),
+                    invitation
+                        .from
+                        .as_deref()
+                        .map_or("Shared with you".to_owned(), |from| format!("From {from}")),
+                    &tag,
+                    false,
+                );
+                tracing::info!(name = %invitation.name, "declining an invitation");
+                let task = Task::perform(cli.reject_invitation(invitation.uid), {
+                    let tag = tag.clone();
+                    move |result| {
+                        Message::InvitationAnswered(
+                            operation,
+                            tag.clone(),
+                            invitation.name.clone(),
+                            result,
+                        )
+                    }
+                });
+                return self.track(operation, task);
+            }
+            Message::InvitationAnswered(operation, tag, name, result) => {
+                self.finish(operation);
+                match result {
+                    Ok(()) => tracing::info!(%name, "invitation answered"),
+                    Err(drive::Error::AuthRequired) => self.signed_out = true,
+                    Err(error) => self.toast(format!("Could not answer for “{name}”: {error}")),
+                }
+                return self.load(&tag);
             }
             Message::DeleteSelected => {
                 let Some((tag, writable)) = self.top_folder() else {
@@ -1234,6 +1351,7 @@ impl App {
             writable: section == Section::MyFiles,
             transfers: 0,
             select_next: Vec::new(),
+            invitations: Vec::new(),
             selected: Selection::Multiple(Default::default()),
         }));
 
@@ -1261,11 +1379,22 @@ impl App {
         };
 
         folder.listing = Listing::Loading;
+        let path = folder.path.clone();
         let tag = tag.to_owned();
 
-        Task::perform(cli.list(folder.path.clone()), move |result| {
-            Message::Listed(tag.clone(), result)
-        })
+        let listing = Task::perform(cli.clone().list(path.clone()), {
+            let tag = tag.clone();
+            move |result| Message::Listed(tag.clone(), result)
+        });
+        if path != Section::SharedWithMe.path() {
+            return listing;
+        }
+
+        // The invitations waiting go above what is shared already.
+        let invitations = Task::perform(cli.invitations(), move |result| {
+            Message::Invitations(tag.clone(), result)
+        });
+        Task::batch([listing, invitations])
     }
 
     /// A row was activated: a folder is pushed, a file downloaded to open.
@@ -1295,6 +1424,7 @@ impl App {
                 writable: self.section != Section::Trash,
                 transfers: 0,
                 select_next: Vec::new(),
+                invitations: Vec::new(),
                 selected: Selection::Multiple(Default::default()),
             };
             let child = self.push(PageKind::Folder(child));
@@ -1450,6 +1580,14 @@ impl App {
             Message::Downloaded(operation, tag.clone(), result)
         });
         self.track(operation, task)
+    }
+
+    /// Whether the page at `tag` lists a section itself, not a folder in it.
+    fn is_section_root(&self, tag: &str) -> bool {
+        self.pages.iter().any(|page| {
+            page.tag == tag
+                && matches!(&page.kind, PageKind::Folder(folder) if folder.path == self.section.path())
+        })
     }
 
     /// The folder on top of the stack, and whether things can go in it.
@@ -2020,11 +2158,25 @@ impl App {
                 } else {
                     ("Folder Is Empty", "")
                 };
-                return status_page()
+                let empty = status_page()
                     .icon(icons::folder())
                     .title(title)
-                    .description(description)
-                    .boxed();
+                    .description(description);
+
+                // Invitations still show over an empty Shared with Me.
+                return match self.invitations_group(tag, folder) {
+                    Some(invitations) => adw::scrollable(
+                        clamp(
+                            column![invitations, empty.compact(true)]
+                                .spacing(12)
+                                .padding([24, 12]),
+                        )
+                        .maximum_size(860)
+                        .tightening_threshold(600),
+                    )
+                    .boxed(),
+                    None => empty.boxed(),
+                };
             }
             Listing::Loaded(entries) => entries,
         };
@@ -2091,12 +2243,59 @@ impl App {
             }
         };
 
-        adw::scrollable(
-            clamp(column![search, list].spacing(12).padding([24, 12]))
-                .maximum_size(860)
-                .tightening_threshold(600),
+        let mut page = iced::widget::Column::<Element<'_, Message>>::new()
+            .spacing(12)
+            .padding([24, 12]);
+        if let Some(invitations) = self.invitations_group(tag, folder) {
+            page = page.push(invitations);
+        }
+        let page = page.push(search.boxed()).push(list);
+
+        adw::scrollable(clamp(page).maximum_size(860).tightening_threshold(600)).boxed()
+    }
+
+    /// The invitations waiting on the Shared with Me page, each with what
+    /// was shared, by whom, and Accept and Decline — `None` without any.
+    fn invitations_group<'a>(
+        &'a self,
+        tag: &str,
+        folder: &'a Folder,
+    ) -> Option<Element<'a, Message>> {
+        if folder.invitations.is_empty() {
+            return None;
+        }
+
+        let rows = folder.invitations.iter().map(|invitation| {
+            let from = invitation.from.as_deref().map_or_else(
+                || "Shared with you".to_owned(),
+                |from| format!("From {from}"),
+            );
+            let accept = adw::text_button("Accept")
+                .style(adw::button::suggested)
+                .on_press(Message::AcceptInvitation(
+                    tag.to_owned(),
+                    invitation.clone(),
+                ));
+            let decline = adw::text_button("Decline").on_press(Message::RejectInvitation(
+                tag.to_owned(),
+                invitation.clone(),
+            ));
+
+            adw::action_row(invitation.name.as_str())
+                .icon(match invitation.kind {
+                    Kind::File => icons::text_x_generic(),
+                    _ => icons::folder(),
+                })
+                .subtitle(format!("{from} · {}", invitation.role))
+                .suffix(row![decline, accept].spacing(6))
+        });
+
+        Some(
+            preferences_group()
+                .title("Invitations")
+                .extend(rows)
+                .boxed(),
         )
-        .boxed()
     }
 
     /// The menu a secondary press on the item at `index` opens: it acts on
@@ -2126,7 +2325,20 @@ impl App {
         };
         let mut entries: Vec<MenuEntry<Message>> = Vec::new();
 
-        if self.section == Section::Trash {
+        if self.section == Section::SharedWithMe && self.is_section_root(tag) {
+            // What was shared with you is left, not trashed or renamed.
+            entries.push(
+                item(download)
+                    .on_activate(Message::Download(tag.to_owned()))
+                    .into(),
+            );
+            entries.push(separator());
+            entries.push(
+                item("Leave")
+                    .on_activate(Message::Leave(tag.to_owned(), entry.uid.clone()))
+                    .into(),
+            );
+        } else if self.section == Section::Trash {
             // What the trash's items can have done, as Files offers it:
             // the CLI neither downloads nor renames them.
             let restore: Vec<Entry> = if selection.is_selected(index) {

@@ -348,6 +348,47 @@ impl Cli {
             .map(|_| ())
     }
 
+    /// The invitations waiting for the account, from Drive and Photos.
+    pub async fn invitations(self) -> Result<Vec<Invitation>, Error> {
+        let stdout = self.run(["invitation", "list", "--json"]).await?;
+        let items: Vec<InvitationJson> = parse_json(&stdout)?;
+
+        Ok(items
+            .into_iter()
+            .map(|item| Invitation {
+                uid: item.uid,
+                name: item
+                    .node
+                    .name
+                    .display()
+                    .unwrap_or_else(|| item.node.uid.clone()),
+                kind: match item.node.kind.as_str() {
+                    "folder" | "album" => Kind::Folder,
+                    _ => Kind::File,
+                },
+                from: item
+                    .added_by_email
+                    .as_ref()
+                    .filter(|author| author.get("ok").and_then(|ok| ok.as_bool()) == Some(true))
+                    .and_then(|author| author.get("value")?.as_str())
+                    .map(str::to_owned),
+                role: Role::parse(&item.role).unwrap_or(Role::Viewer),
+            })
+            .collect())
+    }
+
+    pub async fn accept_invitation(self, uid: String) -> Result<(), Error> {
+        self.run(["invitation", "accept", "--json", "--", &uid])
+            .await
+            .map(|_| ())
+    }
+
+    pub async fn reject_invitation(self, uid: String) -> Result<(), Error> {
+        self.run(["invitation", "reject", "--json", "--", &uid])
+            .await
+            .map(|_| ())
+    }
+
     /// Moves `entries` to the trash.
     pub async fn trash(self, entries: Vec<Entry>) -> Result<Done, Error> {
         let paths = entries.iter().map(|entry| entry.path.clone()).collect();
@@ -673,6 +714,35 @@ fn parse_json<T: serde::de::DeserializeOwned>(stdout: &str) -> Result<T, Error> 
     let start = stdout.find(['[', '{']).unwrap_or(0);
 
     serde_json::from_str(&stdout[start..]).map_err(|error| Error::Parse(error.to_string()))
+}
+
+/// An invitation to something shared with the account, waiting for an
+/// answer — `ProtonInvitationWithNode`, with the CLI's UID for it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Invitation {
+    pub uid: String,
+    pub name: String,
+    pub kind: Kind,
+    /// Who shared it, when their signature verifies.
+    pub from: Option<String>,
+    pub role: Role,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct InvitationJson {
+    uid: String,
+    role: String,
+    added_by_email: Option<serde_json::Value>,
+    node: InvitationNode,
+}
+
+#[derive(Debug, Deserialize)]
+struct InvitationNode {
+    uid: String,
+    name: Name,
+    #[serde(rename = "type")]
+    kind: String,
 }
 
 /// What a member of a share, or the public, may do — the SDK's
