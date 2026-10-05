@@ -372,11 +372,18 @@ impl App {
                                 .filter(|(_, entry)| names.contains(&entry.name))
                                 .map(|(index, _)| index)
                                 .collect();
-                            if !selected.is_empty() {
+                            let first = selected.first().copied();
+                            if first.is_some() {
                                 folder.filter.clear();
                             }
                             folder.selected = Selection::Multiple(selected);
-                            Listing::Loaded(entries)
+                            folder.listing = Listing::Loaded(entries);
+
+                            // And brought into sight, once the view has it.
+                            return match first {
+                                Some(index) => list_view::scroll_to(view_id(&tag), index),
+                                None => Task::none(),
+                            };
                         }
                         Err(drive::Error::AuthRequired) => {
                             self.signed_out = true;
@@ -1412,6 +1419,7 @@ impl App {
                         .context_menu(menu)
                         .rubberband(true)
                         .rich_list()
+                        .id(view_id(tag))
                         .boxed()
                 }
                 View::Grid => {
@@ -1422,6 +1430,7 @@ impl App {
                         .on_activate(on_activate)
                         .context_menu(menu)
                         .rubberband(true)
+                        .id(view_id(tag))
                         .boxed()
                 }
             }
@@ -1726,6 +1735,11 @@ fn transfer_failure(verb: &str, transfer: &Transfer) -> Option<String> {
         [(name, None)] => Some(format!("Could not {verb} “{name}”")),
         failures => Some(format!("Could not {verb} {} items", failures.len())),
     }
+}
+
+/// The id of a folder page's list or grid, to scroll it by.
+fn view_id(tag: &str) -> iced::advanced::widget::Id {
+    format!("{tag}/view").into()
 }
 
 /// A page's title, over a subtitle only when there is one: an empty
