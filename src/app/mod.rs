@@ -16,7 +16,6 @@ use libadwaita_iced::widget::popover_menu::{item, menu_button, separator};
 use libadwaita_iced::widget::sidebar::{self, Mode as SidebarMode};
 use libadwaita_iced::widget::support::Surface;
 use libadwaita_iced::widget::toast::{self, Toasts};
-use libadwaita_iced::widget::toolbar_view::BarStyle;
 use libadwaita_iced::widget::{action_row as row_metrics, grid_view, list_view};
 use libadwaita_iced::widget::{
     clamp, dialog, header_bar, icon, navigation_page, navigation_split_view, navigation_view,
@@ -1303,19 +1302,15 @@ impl App {
 
                 (
                     folder.title.as_str(),
-                    // The page is the view surface, as Files' is — the list
-                    // paints `--view-bg-color` under its rows — so its bar
-                    // is raised over it, as `AdwToolbarView` pairs them.
-                    toolbar_view(
-                        container(self.folder(&page.tag, folder))
-                            .style(adw::container::view)
-                            .width(Fill)
-                            .height(Fill),
-                    )
-                    .top(bar)
-                    .top_bar_style(BarStyle::Raised)
-                    .backdrop(backdrop)
-                    .boxed(),
+                    // The whole pane is the view surface, bar included, as
+                    // Files' window carries `.view` under a flat bar: the
+                    // list paints `--view-bg-color` under its rows, and
+                    // nothing comes between the bar and them.
+                    on_view(
+                        toolbar_view(self.folder(&page.tag, folder))
+                            .top(bar)
+                            .backdrop(backdrop),
+                    ),
                 )
             }
             PageKind::Viewer(viewer) => {
@@ -1344,12 +1339,12 @@ impl App {
 
                 (
                     viewer.entry.name.as_str(),
-                    // Text and images are shown on the view surface too.
-                    toolbar_view(self.viewer(&page.tag, viewer))
-                        .top(bar)
-                        .top_bar_style(BarStyle::Raised)
-                        .backdrop(backdrop)
-                        .boxed(),
+                    // Text and images are shown the same way.
+                    on_view(
+                        toolbar_view(self.viewer(&page.tag, viewer))
+                            .top(bar)
+                            .backdrop(backdrop),
+                    ),
                 )
             }
         };
@@ -1750,6 +1745,16 @@ fn transfer_failure(verb: &str, transfer: &Transfer) -> Option<String> {
         [(name, None)] => Some(format!("Could not {verb} “{name}”")),
         failures => Some(format!("Could not {verb} {} items", failures.len())),
     }
+}
+
+/// A page on the view surface throughout — `window.view`, as Files has
+/// it — with its flat bars showing that surface through them.
+fn on_view<'a>(page: impl Widget<Message> + 'a) -> Element<'a, Message> {
+    container(page)
+        .style(adw::container::view)
+        .width(Fill)
+        .height(Fill)
+        .boxed()
 }
 
 /// The id of a folder page's list or grid, to scroll it by.
