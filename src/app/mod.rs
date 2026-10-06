@@ -73,9 +73,9 @@ pub struct App {
     signed_out: bool,
     sign_in: Option<SignIn>,
     toasts: Toasts<Message>,
-    /// Never added to: the window's overlay shows these while a dialog
-    /// has the toasts.
-    no_toasts: Toasts<Message>,
+    /// What a copy button just put on the clipboard, while it shows a
+    /// check mark for it: "Link".
+    copied: Option<&'static str>,
     scheme: ColorScheme,
     focused: bool,
     maximized: bool,
@@ -407,9 +407,12 @@ pub enum Message {
     SignIn,
     Login(Login),
     CancelSignIn,
-    /// Put the text on the clipboard, and say what it was: "Link".
+    /// Put the text on the clipboard; the button for it — named, as
+    /// "Link" — shows a check mark for a second once it is there.
     CopyText(String, &'static str),
     Copied(&'static str),
+    /// The second is up.
+    CopyShown(&'static str),
     LogOut,
     LoggedOut(Result<(), drive::Error>),
 
@@ -476,7 +479,7 @@ impl App {
             signed_out: false,
             sign_in: None,
             toasts: Toasts::new(),
-            no_toasts: Toasts::new(),
+            copied: None,
             scheme: ColorScheme::Light,
             focused: true,
             maximized: false,
@@ -1409,7 +1412,18 @@ impl App {
             Message::CopyText(text, what) => {
                 return iced::clipboard::write(text).map(move |_| Message::Copied(what));
             }
-            Message::Copied(what) => self.toast(format!("{what} copied")),
+            Message::Copied(what) => {
+                self.copied = Some(what);
+                return Task::perform(
+                    tokio::time::sleep(std::time::Duration::from_secs(1)),
+                    move |_| Message::CopyShown(what),
+                );
+            }
+            Message::CopyShown(what) => {
+                if self.copied == Some(what) {
+                    self.copied = None;
+                }
+            }
             Message::LogOut => {
                 if let Some(cli) = self.cli.clone() {
                     return Task::perform(cli.logout(), Message::LoggedOut);
@@ -1451,10 +1465,6 @@ impl App {
                 self.info = None;
                 self.deleting = None;
                 self.share = None;
-                // The toasts shown in the dialog went with it, as a
-                // libadwaita dialog's overlay goes; the window does not
-                // show them again.
-                self.toasts.dismiss_all();
             }
             Message::CliPathInput(path) => self.cli_path_input = path,
             Message::ApplyCliPath => return self.apply_cli_path(),
@@ -1623,26 +1633,12 @@ impl App {
             .boxed(),
         };
 
-        // A toast shows over what is in front: in the dialog while one is
-        // open, as a dialog carries its own overlay in libadwaita, and in
-        // the window otherwise.
-        let toasts = if self.dialog.is_some() {
-            &self.no_toasts
-        } else {
-            &self.toasts
-        };
-        let content = toast_overlay(content, toasts).on_dismiss(Message::ToastDismissed);
+        let content = toast_overlay(content, &self.toasts).on_dismiss(Message::ToastDismissed);
 
-        let content = dialog(
-            content,
-            self.dialog.map(|which| {
-                toast_overlay(self.dialog_view(which), &self.toasts)
-                    .on_dismiss(Message::ToastDismissed)
-            }),
-        )
-        .open(self.dialog_open)
-        .on_close(Message::CloseDialog)
-        .on_closed(Message::DialogClosed);
+        let content = dialog(content, self.dialog.map(|which| self.dialog_view(which)))
+            .open(self.dialog_open)
+            .on_close(Message::CloseDialog)
+            .on_closed(Message::DialogClosed);
 
         adw::window(content)
             .on_window(Message::Window)
@@ -1867,6 +1863,16 @@ impl App {
 
     fn finish(&mut self, id: u64) {
         self.operations.retain(|operation| operation.id != id);
+    }
+
+    /// A copy button's icon: a check mark for the second after it copied
+    /// `what`, the copy icon otherwise.
+    pub(super) fn copy_icon(&self, what: &'static str) -> icon::Handle {
+        if self.copied == Some(what) {
+            icons::object_select()
+        } else {
+            icons::edit_copy()
+        }
     }
 
     fn toast(&mut self, title: String) {
@@ -3046,7 +3052,7 @@ impl App {
                 row![
                     adw::icon_text_button(icons::adw_external_link(), "Open Browser")
                         .on_press(Message::OpenExternally(url.clone())),
-                    adw::icon_text_button(icons::edit_copy(), "Copy Link")
+                    adw::icon_text_button(self.copy_icon("Sign-in link"), "Copy Link")
                         .on_press(Message::CopyText(url.clone(), "Sign-in link")),
                 ]
                 .spacing(12)
