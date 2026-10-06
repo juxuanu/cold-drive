@@ -1826,6 +1826,161 @@ SQLiteError: database is locked\n\
         assert!(!runs_alone(&["filesystem", "list"].map(OsString::from)));
     }
 
+    /// The CLI's `splitQuotedLine`, as its source has it: what the shell
+    /// makes of a line.
+    fn split_as_the_shell_does(line: &str) -> Vec<String> {
+        let chars: Vec<char> = line.chars().collect();
+        let mut result = Vec::new();
+        let mut current = String::new();
+        let mut quote: Option<char> = None;
+        let mut i = 0;
+        while i < chars.len() && (chars[i] == ' ' || chars[i] == '\t') {
+            i += 1;
+        }
+        while i < chars.len() {
+            let c = chars[i];
+            match quote {
+                Some('"') => {
+                    if c == '\\'
+                        && i + 1 < chars.len()
+                        && (chars[i + 1] == '"' || chars[i + 1] == '\\')
+                    {
+                        current.push(chars[i + 1]);
+                        i += 2;
+                        continue;
+                    }
+                    if c == '"' {
+                        quote = None;
+                    } else {
+                        current.push(c);
+                    }
+                }
+                Some(_) => {
+                    if c == '\'' {
+                        quote = None;
+                    } else {
+                        current.push(c);
+                    }
+                }
+                None => match c {
+                    '"' | '\'' => quote = Some(c),
+                    ' ' | '\t' => {
+                        result.push(std::mem::take(&mut current));
+                        while i + 1 < chars.len() && (chars[i + 1] == ' ' || chars[i + 1] == '\t') {
+                            i += 1;
+                        }
+                    }
+                    c => current.push(c),
+                },
+            }
+            i += 1;
+        }
+        assert!(quote.is_none(), "unclosed quote in {line:?}");
+        result.push(current);
+        result
+    }
+
+    /// The CLI's `splitPathSegments`: an unescaped `/` separates, `\/` is
+    /// a `/` in a name, and any other `\` is itself.
+    fn segments_as_the_cli_does(path: &str) -> Vec<String> {
+        let chars: Vec<char> = path.chars().collect();
+        let mut segments = Vec::new();
+        let mut current = String::new();
+        let mut i = 0;
+        while i < chars.len() {
+            if chars[i] == '\\' && i + 1 < chars.len() && chars[i + 1] == '/' {
+                current.push('/');
+                i += 2;
+                continue;
+            }
+            if chars[i] == '/' {
+                segments.push(std::mem::take(&mut current));
+            } else {
+                current.push(chars[i]);
+            }
+            i += 1;
+        }
+        segments.push(current);
+        segments
+    }
+
+    /// Names and texts that a shell, a path syntax or a terminal might
+    /// read as something else.
+    const AWKWARD: [&str; 16] = [
+        "plain",
+        "with spaces  and  doubles",
+        "tab\there",
+        "quo\"ted \"twice\"",
+        "back\\slash \\\\ two",
+        "it's 'single' quoted",
+        "$HOME `tick` #hash ;semi |pipe &amp *star ?q",
+        "-leading-dash",
+        "--",
+        "ünïcödé ñ",
+        "日本語の名前",
+        "🚀 rocket 👩‍💻",
+        "trailing backslash \\",
+        "trailing space ",
+        "",
+        "\"",
+    ];
+
+    #[test]
+    fn every_argument_survives_the_shell_as_itself() {
+        for awkward in AWKWARD {
+            let args: Vec<OsString> = ["filesystem", "rename", "--", "/my-files/x", awkward]
+                .map(OsString::from)
+                .into();
+            let line = quote_line(&args);
+            assert!(!line.contains('\n'), "{line:?}");
+            let read = split_as_the_shell_does(&line);
+            assert_eq!(
+                read,
+                ["filesystem", "rename", "--", "/my-files/x", awkward],
+                "{line}"
+            );
+        }
+        // One line is one command: a newline cannot be sent, and becomes a space.
+        let args = ["message with\na newline\r\n"].map(OsString::from);
+        assert_eq!(
+            split_as_the_shell_does(&quote_line(&args)),
+            ["message with a newline  "]
+        );
+        // A long line is still one command.
+        let long: OsString = "x".repeat(20_000).into();
+        assert_eq!(
+            split_as_the_shell_does(&quote_line(std::slice::from_ref(&long)))[0].len(),
+            20_000
+        );
+    }
+
+    #[test]
+    fn a_trashed_name_comes_back_from_its_path() {
+        for name in [
+            "plain.txt",
+            "a/b",
+            "a\\b",
+            "a\\/b",
+            "ends with slash/",
+            "/starts with slash",
+            "back\\",
+            "two//slashes",
+        ] {
+            let segments = segments_as_the_cli_does(&trash_path(name));
+            assert_eq!(segments, ["", "trash", name], "{}", trash_path(name));
+        }
+        // And through the shell's quoting on the way.
+        for name in ["a/b", "a\\/b", "quo\"te\\"] {
+            let line = quote_line(&[trash_path(name).into()]);
+            let path = &split_as_the_shell_does(&line)[0];
+            assert_eq!(
+                segments_as_the_cli_does(path),
+                ["", "trash", name],
+                "{line}"
+            );
+        }
+    }
+
     /// The installed CLI's shell, with listings only: run by hand with
     /// `cargo test -- --ignored`.
     #[tokio::test]
@@ -1839,10 +1994,24 @@ SQLiteError: database is locked\n\
         let (first, again) = (first.expect("list"), again.expect("list again"));
         assert_eq!(first.len(), again.len());
 
-        let missing = cli.clone().list("/my-files/no such folder".into()).await;
+        // A missing node's name comes back in the error exactly as sent,
+        // whatever is in it: the proof that the quoting is the shell's.
+        for awkward in AWKWARD {
+            if awkward.is_empty() || awkward.contains('\t') || awkward.contains('/') {
+                continue;
+            }
+            let missing = cli.clone().list(format!("/my-files/{awkward}")).await;
+            // The message is read trimmed, so a trailing space is not told.
+            let expected = format!("Node not found: {}", awkward.trim_end());
+            assert!(
+                matches!(&missing, Err(Error::Failed(message)) if *message == expected),
+                "{awkward:?}: {missing:?}"
+            );
+        }
+        let slashed = cli.clone().list("/my-files/sl\\/ash".into()).await;
         assert!(
-            matches!(&missing, Err(Error::Failed(message)) if message.contains("not found")),
-            "{missing:?}"
+            matches!(&slashed, Err(Error::Failed(message)) if message == "Node not found: sl/ash"),
+            "{slashed:?}"
         );
         let version = cli.clone().version().await.expect("version");
         assert!(version.starts_with("CLI "), "{version}");
