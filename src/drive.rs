@@ -41,7 +41,45 @@ pub struct Cli {
     lane: Arc<tokio::sync::Mutex<()>>,
     /// The CLI's own shell, kept running for the commands that are quick:
     /// one start, one cache opened. See [`Shell`].
-    shell: Arc<tokio::sync::Mutex<Option<Shell>>>,
+    shell: Arc<tokio::sync::Mutex<Shells>>,
+}
+
+/// The shell in use, if one is up, and how it has been faring: a shell
+/// that ends is started again for the next command, but one that keeps
+/// ending — [`SHELL_ENDINGS`] times with no command done between — is
+/// left alone for [`SHELL_REST`], the commands running one-shot meanwhile.
+#[derive(Debug, Default)]
+struct Shells {
+    shell: Option<Shell>,
+    endings: u32,
+    last_ending: Option<Instant>,
+}
+
+const SHELL_ENDINGS: u32 = 3;
+const SHELL_REST: Duration = Duration::from_secs(60);
+
+impl Shells {
+    /// The shell ended, or could not start, on its own.
+    fn ended(&mut self) {
+        self.shell = None;
+        self.endings += 1;
+        self.last_ending = Some(Instant::now());
+    }
+
+    /// Whether the shell is being left alone for now.
+    fn resting(&mut self) -> bool {
+        if self.endings < SHELL_ENDINGS {
+            return false;
+        }
+        match self.last_ending {
+            Some(at) if at.elapsed() < SHELL_REST => true,
+            _ => {
+                // Rested: one more chance, and the rest again if it fails.
+                self.endings = SHELL_ENDINGS - 1;
+                false
+            }
+        }
+    }
 }
 
 /// `proton-drive` with no arguments: its interactive shell, which takes
@@ -141,10 +179,18 @@ impl Drop for Flight<'_> {
         if !self.done
             && let Some(mut shell) = self.shell.take()
         {
-            tracing::info!("the CLI's shell is killed with the command cancelled");
+            tracing::info!("the CLI's shell is killed mid-command");
             let _ = shell.child.start_kill();
         }
     }
+}
+
+/// Sends the line to the shell and reads how it ends.
+async fn drive(shell: &mut Shell, line: &str) -> Result<Outcome, Error> {
+    shell.stdin.write_all(line.as_bytes()).await?;
+    shell.stdin.write_all(b"\n").await?;
+    shell.stdin.flush().await?;
+    shell.until_prompt().await
 }
 
 /// A command as a line for the shell: every argument in double quotes,
@@ -800,7 +846,7 @@ impl Cli {
     pub async fn logout(self) -> Result<(), Error> {
         self.run(["auth", "logout"]).await?;
         // The shell's session is the old one.
-        self.shell.lock().await.take();
+        self.shell.lock().await.shell.take();
         Ok(())
     }
 
@@ -857,7 +903,7 @@ impl Cli {
                 Ok(()) => {
                     tracing::info!("signed in");
                     // The shell's session, if one is up, is the old one.
-                    self.shell.lock().await.take();
+                    self.shell.lock().await.shell.take();
                 }
                 Err(error) => tracing::warn!(%error, "sign-in failed"),
             }
@@ -903,45 +949,73 @@ impl Cli {
         }
     }
 
-    /// Runs the command in the shell, started if it is not up.
+    /// Runs the command in the shell, started if it is not up — or in a
+    /// CLI of its own while the shell is left alone, or will not start.
     async fn in_shell(&self, args: Vec<OsString>) -> Result<(String, Result<(), Error>), Error> {
         let line = quote_line(&args);
         let mut guard = self.shell.lock().await;
-        if guard.is_none() {
-            *guard = Some(self.start_shell().await?);
+        let shells = &mut *guard;
+
+        if shells.resting() {
+            tracing::debug!(command = %line, "the shell is resting; running alone");
+            drop(guard);
+            return self.execute_alone(args).await;
         }
-        let mut flight = Flight {
-            shell: &mut guard,
-            done: false,
-        };
-        let shell = flight
-            .shell
-            .as_mut()
-            .ok_or_else(|| Error::Io("the shell is gone".into()))?;
+        if shells.shell.is_none() {
+            match self.start_shell().await {
+                Ok(shell) => shells.shell = Some(shell),
+                Err(error) => {
+                    tracing::warn!(%error, "the CLI's shell did not start; running alone");
+                    shells.ended();
+                    drop(guard);
+                    return self.execute_alone(args).await;
+                }
+            }
+        }
 
         tracing::debug!(command = %line, "running in the shell");
         let started = Instant::now();
-        shell.stdin.write_all(line.as_bytes()).await?;
-        shell.stdin.write_all(b"\n").await?;
-        shell.stdin.flush().await?;
-        let outcome = shell.until_prompt().await?;
+        let outcome = {
+            let mut flight = Flight {
+                shell: &mut shells.shell,
+                done: false,
+            };
+            let outcome = match flight.shell.as_mut() {
+                Some(shell) => drive(shell, &line).await,
+                None => Err(Error::Io("the shell is gone".into())),
+            };
+            // A pipe that failed leaves the shell unusable: the flight
+            // kills it on the way out.
+            flight.done = outcome.is_ok();
+            outcome
+        };
         let elapsed = started.elapsed();
 
         let (out, err, status) = match outcome {
-            Outcome::Prompt { out, err } => (out, err, None),
-            Outcome::Ended { out, err } => {
-                let status = shell.child.wait().await?;
-                tracing::warn!(%status, "the CLI's shell ended");
-                flight.shell.take();
-                (out, err, Some(status))
+            Ok(Outcome::Prompt { out, err }) => {
+                shells.endings = 0;
+                (out, err, None)
+            }
+            Ok(Outcome::Ended { out, err }) => {
+                let status = match &mut shells.shell {
+                    Some(shell) => Some(shell.child.wait().await?),
+                    None => None,
+                };
+                tracing::warn!(status = ?status, "the CLI's shell ended");
+                shells.ended();
+                (out, err, status)
+            }
+            Err(error) => {
+                tracing::warn!(%error, "the CLI's shell could not be reached");
+                shells.ended();
+                return Err(error);
             }
         };
-        flight.done = true;
-        drop(flight);
+        let ended = status.is_some();
 
         let stdout = String::from_utf8_lossy(&out).into_owned();
         let stderr = String::from_utf8_lossy(&err);
-        if status.is_none() && stderr.trim().is_empty() {
+        if !ended && stderr.trim().is_empty() {
             tracing::info!(command = %line, ?elapsed, bytes = stdout.len(), "done");
             Ok((stdout, Ok(())))
         } else {
@@ -1748,6 +1822,23 @@ SQLiteError: database is locked\n\
         );
         let version = cli.clone().version().await.expect("version");
         assert!(version.starts_with("CLI "), "{version}");
+
+        // A shell killed from outside fails the command that finds it
+        // gone, and the next command gets a new one.
+        if let Some(shell) = &mut cli.shell.lock().await.shell {
+            shell.child.start_kill().expect("kill");
+            let _ = shell.child.wait().await;
+        }
+        let found_gone = cli.clone().list("/my-files".into()).await;
+        assert!(found_gone.is_err(), "{found_gone:?}");
+        assert_eq!(cli.shell.lock().await.endings, 1);
+        let after = cli
+            .clone()
+            .list("/my-files".into())
+            .await
+            .expect("list after the kill");
+        assert_eq!(after.len(), first.len());
+        assert_eq!(cli.shell.lock().await.endings, 0);
     }
 
     #[test]
