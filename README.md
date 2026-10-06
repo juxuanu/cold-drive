@@ -20,7 +20,8 @@ official [Proton Drive CLI](https://github.com/ProtonDriveApps/sdk/blob/main/cli
   it, behind one too.
 - Copy (Ctrl+C) or Cut (Ctrl+X) the selection and Paste (Ctrl+V) it into the
   folder shown, from the menu on a right click where no row is, or into a
-  folder on the page from its own menu. A cut pastes as a move.
+  folder on the page from its own menu, or from the banner that says what
+  was taken. A cut pastes as a move.
 - List or grid view, remembered between runs.
 - Keyboard shortcuts in a dialog (Ctrl+?).
 - Sign in through the browser; the preferences show the account and the CLI in

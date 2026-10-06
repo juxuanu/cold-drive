@@ -2410,7 +2410,24 @@ impl App {
                         .clipboard
                         .as_ref()
                         .map(|_| Message::Paste(page.tag.clone()));
-                    adw::context_menu(container(view))
+                    // And over it, while something is taken, a banner
+                    // saying so with Paste Here: the way to paste without
+                    // a key or a menu.
+                    let taken = self.clipboard.as_ref().map(|clipboard| {
+                        let what = describe(&clipboard.entries);
+                        if clipboard.cut {
+                            format!("{what} cut")
+                        } else {
+                            format!("{what} copied")
+                        }
+                    });
+                    let paste_bar = adw::banner(taken.clone().unwrap_or_default())
+                        .button("Paste Here", Message::Paste(page.tag.clone()))
+                        .surface(Surface::View)
+                        .backdrop(backdrop)
+                        .revealed(taken.is_some())
+                        .boxed();
+                    let menu = adw::context_menu(container(view))
                         .push(
                             item("New Folder…")
                                 .accelerator("Ctrl+N")
@@ -2429,7 +2446,8 @@ impl App {
                                 .accelerator("Ctrl+A")
                                 .on_activate(Message::SelectAll(page.tag.clone())),
                         )
-                        .boxed()
+                        .boxed();
+                    column![paste_bar, menu].boxed()
                 } else {
                     view
                 };
