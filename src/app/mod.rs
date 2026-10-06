@@ -1451,6 +1451,10 @@ impl App {
                 self.info = None;
                 self.deleting = None;
                 self.share = None;
+                // The toasts shown in the dialog went with it, as a
+                // libadwaita dialog's overlay goes; the window does not
+                // show them again.
+                self.toasts.dismiss_all();
             }
             Message::CliPathInput(path) => self.cli_path_input = path,
             Message::ApplyCliPath => return self.apply_cli_path(),
