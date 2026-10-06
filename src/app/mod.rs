@@ -111,6 +111,8 @@ pub enum Dialog {
     Info,
     /// Files' "Permanently Delete…?" alert.
     Delete,
+    /// Files' "Empty Trash?" alert.
+    EmptyTrash,
     Share,
 }
 
@@ -307,6 +309,10 @@ pub enum Message {
     ConfirmDelete(String),
     DeleteForever,
     Deleted(u64, String, Vec<Entry>, Result<Done, drive::Error>),
+    /// Ask before emptying the trash: the banner on its page.
+    ConfirmEmptyTrash,
+    EmptyTrash,
+    TrashEmptied(u64, Result<(), drive::Error>),
     /// Delete: the trash on a folder page, for good in the trash.
     DeleteSelected,
     /// Open the Share dialog on the item.
@@ -1053,6 +1059,41 @@ impl App {
                     Err(error) => self.toast(format!("Could not delete: {error}")),
                 }
                 return self.load(&tag);
+            }
+            Message::ConfirmEmptyTrash => {
+                self.dialog = Some(Dialog::EmptyTrash);
+                self.dialog_open = true;
+            }
+            Message::EmptyTrash => {
+                let Some(cli) = self.cli.clone() else {
+                    return Task::none();
+                };
+                self.dialog_open = false;
+
+                let tag = self.top_folder().map(|(tag, _)| tag).unwrap_or_default();
+                let operation = self.begin(
+                    "Emptying Trash".to_owned(),
+                    "Deleting everything in it permanently".to_owned(),
+                    &tag,
+                    false,
+                );
+                tracing::info!("emptying the trash");
+                let task = Task::perform(cli.empty_trash(), move |result| {
+                    Message::TrashEmptied(operation, result)
+                });
+                return self.track(operation, task);
+            }
+            Message::TrashEmptied(operation, result) => {
+                self.finish(operation);
+                match result {
+                    Ok(()) => tracing::info!("trash emptied"),
+                    Err(drive::Error::AuthRequired) => self.signed_out = true,
+                    Err(error) => self.toast(format!("Could not empty the trash: {error}")),
+                }
+                // Everything in it is gone, so back to its root.
+                if self.section == Section::Trash {
+                    return self.open_section(Section::Trash);
+                }
             }
             Message::Escape => {
                 // A dialog takes its own Escape; so does an open menu.
@@ -2192,17 +2233,32 @@ impl App {
                     bar = bar.start(indicator);
                 }
 
+                let view = self.folder(&page.tag, folder);
+                let view: Element<'_, Message> = if self.section == Section::Trash {
+                    // Files' trash bar: a banner over the view with the
+                    // way to empty it. With nothing listed there is
+                    // nothing to empty, and the banner slides away.
+                    let full =
+                        matches!(&folder.listing, Listing::Loaded(entries) if !entries.is_empty());
+                    let trash_bar =
+                        adw::banner("Items in the Trash still count toward your storage")
+                            .button("Empty Trash…", Message::ConfirmEmptyTrash)
+                            .surface(Surface::View)
+                            .backdrop(backdrop)
+                            .revealed(full)
+                            .boxed();
+                    column![trash_bar, view].boxed()
+                } else {
+                    view
+                };
+
                 (
                     folder.title.as_str(),
                     // The whole pane is the view surface, bar included, as
                     // Files' window carries `.view` under a flat bar: the
                     // list paints `--view-bg-color` under its rows, and
                     // nothing comes between the bar and them.
-                    on_view(
-                        toolbar_view(self.folder(&page.tag, folder))
-                            .top(bar)
-                            .backdrop(backdrop),
-                    ),
+                    on_view(toolbar_view(view).top(bar).backdrop(backdrop)),
                 )
             }
             PageKind::Viewer(viewer) => {

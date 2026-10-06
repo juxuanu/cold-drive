@@ -34,6 +34,7 @@ impl App {
             Dialog::Shortcuts => shortcuts(),
             Dialog::Info => self.info(),
             Dialog::Delete => self.delete_alert(),
+            Dialog::EmptyTrash => Self::empty_trash_alert(),
             Dialog::Share => self.share(),
         }
     }
@@ -203,6 +204,15 @@ impl App {
             .body("Permanently deleted items can't be restored")
             .response(response("Cancel", Message::CloseDialog).default_response())
             .response(response("Delete", Message::DeleteForever).destructive())
+            .boxed()
+    }
+
+    /// Files' alert before emptying the trash, word for word.
+    fn empty_trash_alert() -> Element<'static, Message> {
+        alert_dialog("Empty Trash?")
+            .body("All items in the Trash will be permanently deleted")
+            .response(response("Cancel", Message::CloseDialog).default_response())
+            .response(response("Empty Trash", Message::EmptyTrash).destructive())
             .boxed()
     }
 

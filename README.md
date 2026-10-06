@@ -16,7 +16,8 @@ official [Proton Drive CLI](https://github.com/ProtonDriveApps/sdk/blob/main/cli
   everything. A double click or Enter opens. A right click offers Download…
   (the selection, into a folder you choose), Rename… (F2), Move to Trash
   (Delete, undone from the toast) and Info; in the Trash, Restore and Delete
-  Permanently…, behind a confirmation.
+  Permanently…, behind a confirmation. The banner on the Trash page empties
+  it, behind one too.
 - List or grid view, remembered between runs.
 - Keyboard shortcuts in a dialog (Ctrl+?).
 - Sign in through the browser; the preferences show the account and the CLI in

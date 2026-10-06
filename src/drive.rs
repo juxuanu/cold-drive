@@ -429,6 +429,14 @@ impl Cli {
         self.node_op("delete", paths, &entries).await
     }
 
+    /// Deletes everything in the trash for good. The CLI starts it and
+    /// returns, so a listing right after may still show the items.
+    pub async fn empty_trash(self) -> Result<(), Error> {
+        self.run(["filesystem", "empty-trash", "--json"])
+            .await
+            .map(|_| ())
+    }
+
     /// Runs `filesystem <command>` over `paths`, and reads the result it
     /// prints for each node, named after `entries`.
     async fn node_op(
