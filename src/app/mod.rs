@@ -147,8 +147,21 @@ pub(super) struct Share {
     /// The link's password and expiry as being edited, applied on demand.
     link_password: String,
     link_expiry: String,
-    /// A change is under way at the CLI.
-    busy: bool,
+    /// The change under way at the CLI, with its spinner in its row.
+    busy: Option<Busy>,
+}
+
+/// What the Share dialog is asking of the CLI.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Busy {
+    Invite,
+    /// Removing this email from the share.
+    Uninvite(String),
+    /// Turning the public link on or off.
+    Link,
+    LinkRole,
+    /// The link's password and expiry.
+    LinkSettings,
 }
 
 impl Share {
@@ -647,7 +660,7 @@ impl App {
                     include_name: false,
                     link_password: String::new(),
                     link_expiry: String::new(),
-                    busy: false,
+                    busy: None,
                 });
                 self.dialog = Some(Dialog::Share);
                 self.dialog_open = true;
@@ -660,7 +673,7 @@ impl App {
                 if let Some(share) = &mut self.share
                     && share.entry.uid == uid
                 {
-                    share.busy = false;
+                    share.busy = None;
                     match result {
                         Ok(sharing) => {
                             // The link's settings as they stand, to edit.
@@ -749,11 +762,11 @@ impl App {
                 let (Some(link), Ok(expiry)) = (share.link(), share.expiry()) else {
                     return Task::none();
                 };
-                if share.busy {
+                if share.busy.is_some() {
                     return Task::none();
                 }
                 let (role, password) = (link.role, Some(share.link_password.clone()));
-                share.busy = true;
+                share.busy = Some(Busy::LinkSettings);
                 let (uid, path) = (share.entry.uid.clone(), share.entry.path.clone());
                 tracing::info!(
                     password = if share.link_password.is_empty() {
@@ -776,10 +789,10 @@ impl App {
                     return Task::none();
                 };
                 let email = share.email.trim().to_owned();
-                if share.busy || !looks_like_email(&email) {
+                if share.busy.is_some() || !looks_like_email(&email) {
                     return Task::none();
                 }
-                share.busy = true;
+                share.busy = Some(Busy::Invite);
                 share.email.clear();
                 let (uid, path, role) = (
                     share.entry.uid.clone(),
@@ -801,10 +814,10 @@ impl App {
                 let Some(share) = &mut self.share else {
                     return Task::none();
                 };
-                if share.busy {
+                if share.busy.is_some() {
                     return Task::none();
                 }
-                share.busy = true;
+                share.busy = Some(Busy::Uninvite(email.clone()));
                 let (uid, path) = (share.entry.uid.clone(), share.entry.path.clone());
                 tracing::info!(%email, "removing from the share");
                 return Task::perform(cli.unshare(path, vec![email]), move |result| {
@@ -818,10 +831,10 @@ impl App {
                 let Some(share) = &mut self.share else {
                     return Task::none();
                 };
-                if share.busy {
+                if share.busy.is_some() {
                     return Task::none();
                 }
-                share.busy = true;
+                share.busy = Some(Busy::Link);
                 let (uid, path) = (share.entry.uid.clone(), share.entry.path.clone());
                 tracing::info!(on, "public link");
                 let change = async move {
@@ -842,7 +855,7 @@ impl App {
                 let Some(share) = &mut self.share else {
                     return Task::none();
                 };
-                if share.busy {
+                if share.busy.is_some() {
                     return Task::none();
                 }
                 // The role goes with the password and expiry the link has.
@@ -850,7 +863,7 @@ impl App {
                     Some(link) => (link.password.clone(), link.expires.clone()),
                     None => (None, None),
                 };
-                share.busy = true;
+                share.busy = Some(Busy::LinkRole);
                 let (uid, path) = (share.entry.uid.clone(), share.entry.path.clone());
                 tracing::info!(%role, "public link role");
                 return Task::perform(cli.set_link(path, role, password, expiry), move |result| {
@@ -3154,7 +3167,9 @@ fn taken_banner<'a>(
         }
     });
     let bar = row![
-        typography::heading(title).center().width(Fill),
+        container(typography::heading(title))
+            .width(Fill)
+            .padding(iced::padding::left(6.0)),
         adw::text_button("Paste Here").on_press(on_paste),
         adw::circular_button(icons::window_close())
             .style(adw::button::flat)

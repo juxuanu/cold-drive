@@ -3,6 +3,7 @@
 use iced::widget::{column, text};
 use iced::{Alignment, Fill};
 use libadwaita_iced::widget::about_dialog;
+use libadwaita_iced::widget::boxed_list::ListRow;
 use libadwaita_iced::widget::entry_row::EntryStyle;
 use libadwaita_iced::widget::view_switcher::page;
 use libadwaita_iced::widget::{
@@ -16,7 +17,7 @@ use libadwaita_iced::widget::{
 use libadwaita_iced::{Element, Widget, icons, typography, widget as adw};
 
 use super::looks_like_email;
-use super::{App, Dialog, Message};
+use super::{App, Busy, Dialog, Message};
 use crate::drive::{self, Kind, Role, Source};
 use crate::{files, format};
 
@@ -235,14 +236,19 @@ impl App {
                 people = people.push(info_row("Could Not Read the Sharing", error.clone()));
             }
             Some(Ok(sharing)) => {
-                let can_send = looks_like_email(share.email.trim()) && !share.busy;
+                // Each change asked of the CLI spins in its own row, as
+                // Proton's dialog does, and the rest waits.
+                let busy = share.busy.as_ref();
+                let can_send = looks_like_email(share.email.trim()) && busy.is_none();
+                let mut email = entry_row("Email address", &share.email)
+                    .on_input(Message::ShareEmail)
+                    .on_submit(Message::Invite)
+                    .on_apply(can_send.then_some(Message::Invite));
+                if busy == Some(&Busy::Invite) {
+                    email = email.suffix(spinner());
+                }
                 people = people
-                    .push(
-                        entry_row("Email address", &share.email)
-                            .on_input(Message::ShareEmail)
-                            .on_submit(Message::Invite)
-                            .on_apply(can_send.then_some(Message::Invite)),
-                    )
+                    .push(email)
                     .push(
                         combo_row("Invite as", Some(share.role), Role::ALL, |role| {
                             role.label().to_owned()
@@ -266,24 +272,34 @@ impl App {
                     } else {
                         member.role.label().to_owned()
                     };
-                    let remove = adw::icon_button(icons::user_trash())
-                        .style(adw::button::flat)
-                        .on_press_maybe(
-                            (!share.busy).then(|| Message::Uninvite(member.email.clone())),
-                        );
-                    people = people.push(
-                        action_row(member.email.as_str())
-                            .subtitle(subtitle)
-                            .suffix(remove),
-                    );
+                    let row = action_row(member.email.as_str()).subtitle(subtitle);
+                    people = people.push(if busy == Some(&Busy::Uninvite(member.email.clone())) {
+                        row.suffix(spinner())
+                    } else {
+                        row.suffix(
+                            adw::icon_button(icons::user_trash())
+                                .style(adw::button::flat)
+                                .on_press_maybe(
+                                    busy.is_none()
+                                        .then(|| Message::Uninvite(member.email.clone())),
+                                ),
+                        )
+                    });
                 }
 
                 let public = sharing.as_ref().and_then(|sharing| sharing.link.as_ref());
-                link = link.push(
+                link = link.push(if busy == Some(&Busy::Link) {
+                    ListRow::from(
+                        action_row("Share via Link")
+                            .subtitle("Anyone with the link")
+                            .suffix(spinner()),
+                    )
+                } else {
                     switch_row("Share via Link", public.is_some())
                         .subtitle("Anyone with the link")
-                        .on_toggle(Message::LinkToggled),
-                );
+                        .on_toggle(Message::LinkToggled)
+                        .into()
+                });
                 if let Some(public) = public {
                     let copy = adw::icon_button(icons::edit_copy())
                         .style(adw::button::flat)
@@ -298,15 +314,22 @@ impl App {
                                 .subtitle(about.join(" · "))
                                 .suffix(copy),
                         )
-                        .push(
+                        .push(if busy == Some(&Busy::LinkRole) {
+                            ListRow::from(
+                                action_row("Anyone with the link is")
+                                    .subtitle(public.role.label())
+                                    .suffix(spinner()),
+                            )
+                        } else {
                             combo_row(
                                 "Anyone with the link is",
                                 Some(public.role),
                                 [Role::Viewer, Role::Editor],
                                 |role| role.label().to_owned(),
                             )
-                            .on_select(Message::LinkRole),
-                        );
+                            .on_select(Message::LinkRole)
+                            .into()
+                        });
 
                     // The password and the expiry are applied together, as
                     // the CLI sets them: the apply button shows once either
@@ -325,38 +348,37 @@ impl App {
                                     .date_naive()
                                     .to_string()
                             });
-                    let apply = (!share.busy && expiry_ok && (password_changed || expiry_changed))
-                        .then_some(Message::LinkApply);
+                    let apply =
+                        (busy.is_none() && expiry_ok && (password_changed || expiry_changed))
+                            .then_some(Message::LinkApply);
+                    let applying = busy == Some(&Busy::LinkSettings);
 
-                    link = link
-                        .push(
-                            password_entry_row("Password", &share.link_password)
-                                .on_input(Message::LinkPassword)
-                                .on_submit(Message::LinkApply)
-                                .on_apply(apply.clone()),
-                        )
-                        .push(
-                            entry_row("Expires on (YYYY-MM-DD)", &share.link_expiry)
-                                .on_input(Message::LinkExpiry)
-                                .on_submit(Message::LinkApply)
-                                .on_apply(apply)
-                                .style(if expiry_ok {
-                                    EntryStyle::Default
-                                } else {
-                                    EntryStyle::Error
-                                }),
-                        );
+                    let mut password = password_entry_row("Password", &share.link_password)
+                        .on_input(Message::LinkPassword)
+                        .on_submit(Message::LinkApply)
+                        .on_apply(apply.clone());
+                    let mut expiry = entry_row("Expires on (YYYY-MM-DD)", &share.link_expiry)
+                        .on_input(Message::LinkExpiry)
+                        .on_submit(Message::LinkApply)
+                        .on_apply(apply)
+                        .style(if expiry_ok {
+                            EntryStyle::Default
+                        } else {
+                            EntryStyle::Error
+                        });
+                    if applying {
+                        password = password.suffix(spinner());
+                        expiry = expiry.suffix(spinner());
+                    }
+                    link = link.push(password).push(expiry);
                 }
             }
         }
 
         let page = adw::scrollable(column![people, link].spacing(24).padding([24, 18]));
-        let mut bar = header_bar()
+        let bar = header_bar()
             .title(window_title("Share").subtitle(share.entry.name.as_str()))
             .on_close(Message::CloseDialog);
-        if share.busy {
-            bar = bar.end(spinner());
-        }
 
         toolbar_view(page).top(bar).width(480).height(600).boxed()
     }
