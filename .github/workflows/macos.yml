@@ -1,0 +1,29 @@
+# A macOS build to try the app there: run it from the Actions tab, or let
+# a push to main run it, and download the artifact.
+name: macOS
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+jobs:
+  build:
+    name: Build for macOS (Apple silicon)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build
+        run: cargo build --release
+      - name: Test
+        run: cargo test --release
+        env:
+          ICED_TEST_BACKEND: tiny-skia
+      - name: Keep the binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: cold-drive-macos-arm64
+          path: target/release/cold-drive
+          if-no-files-found: error
