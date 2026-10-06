@@ -2131,7 +2131,15 @@ SQLiteError: database is locked\n\
 
     #[test]
     fn failures_are_read_from_stderr() {
-        let status = std::process::Command::new("false").status().unwrap();
+        // A failing exit status, from whatever the platform has.
+        let status = if cfg!(windows) {
+            std::process::Command::new("cmd")
+                .args(["/C", "exit 1"])
+                .status()
+        } else {
+            std::process::Command::new("false").status()
+        }
+        .unwrap();
 
         assert!(matches!(
             failure("You need to login first\n", Some(status)),

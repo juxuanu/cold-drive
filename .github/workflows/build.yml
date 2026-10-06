@@ -1,0 +1,42 @@
+# Builds to try the app on each platform: run from the Actions tab, or let a
+# push to main run them, and download the artifact for yours.
+name: Build
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            name: linux-x86_64
+            bin: cold-drive
+          - os: macos-latest
+            name: macos-arm64
+            bin: cold-drive
+          - os: windows-latest
+            name: windows-x86_64
+            bin: cold-drive.exe
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build
+        run: cargo build --release
+      - name: Test
+        run: cargo test --release
+        env:
+          ICED_TEST_BACKEND: tiny-skia
+      - name: Keep the binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: cold-drive-${{ matrix.name }}
+          path: target/release/${{ matrix.bin }}
+          if-no-files-found: error
