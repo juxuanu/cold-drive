@@ -427,8 +427,20 @@ impl App {
         let _ = std::fs::remove_dir_all(files::cache_dir_root());
 
         let config = Config::load();
-        let mut app = Self {
-            cli: Cli::locate(config.cli_path.as_deref()),
+        let cli = Cli::locate(config.cli_path.as_deref());
+        let mut app = Self::blank(config, cli);
+
+        let load = app.open_section(Section::MyFiles);
+        (
+            app,
+            Task::batch([iced::system::theme().map(Message::SystemScheme), load]),
+        )
+    }
+
+    /// The app before anything is shown.
+    fn blank(config: Config, cli: Option<Cli>) -> Self {
+        Self {
+            cli,
             cli_path_input: config
                 .cli_path
                 .as_deref()
@@ -457,13 +469,7 @@ impl App {
             operations: Vec::new(),
             next_operation: 0,
             info: None,
-        };
-
-        let load = app.open_section(Section::MyFiles);
-        (
-            app,
-            Task::batch([iced::system::theme().map(Message::SystemScheme), load]),
-        )
+        }
     }
 
     pub fn theme(&self) -> Adwaita {
@@ -3248,6 +3254,116 @@ impl Section {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use std::time::Duration;
+
+    use iced_test::Simulator;
+
+    fn entry(name: &str, kind: Kind) -> Entry {
+        Entry {
+            uid: name.to_owned(),
+            name: name.to_owned(),
+            kind,
+            media_type: None,
+            size: None,
+            modified: None,
+            shared: false,
+            revision: None,
+            path: format!("/my-files/{name}"),
+        }
+    }
+
+    /// An app showing My Files listed as `entries`, with no CLI behind it.
+    fn showing(entries: Vec<Entry>) -> App {
+        let config = Config {
+            cli_path: None,
+            view: View::List,
+        };
+        let mut app = App::blank(config, Some(Cli::never_run()));
+        app.push(PageKind::Folder(Folder {
+            title: Section::MyFiles.title().into(),
+            trail: Section::MyFiles.title().into(),
+            path: Section::MyFiles.path().into(),
+            listing: Listing::Loaded(entries),
+            filter: String::new(),
+            opening: None,
+            writable: true,
+            transfers: 0,
+            select_next: Vec::new(),
+            invitations: Vec::new(),
+            selected: Selection::Multiple(Default::default()),
+        }));
+        app
+    }
+
+    /// A click on the first row of the one folder page's list — the
+    /// row's name is a typography text, which no text selector sees.
+    fn click_first_row(ui: &mut Simulator<'_, Message, Adwaita>) {
+        // The list hands no id to a container operation, so it is found
+        // by what it is: the one scrollable's content, below the search
+        // entry — the text input — with the first row at its top.
+        let mut found = None;
+        let _ = ui.find(|candidate: iced_test::selector::Candidate<'_>| {
+            if let iced_test::selector::Candidate::TextInput { bounds, .. } = candidate {
+                found = Some(bounds);
+            }
+            None::<()>
+        });
+        let search = found.expect("the search entry");
+        // 12px below the entry, then 20px into the first row.
+        ui.point_at(iced::Point::new(
+            search.center_x(),
+            search.y + search.height + 12.0 + 20.0,
+        ));
+        let _ = ui.simulate(iced_test::simulator::click());
+    }
+
+    /// The first click on a row selects it, and the app shows the
+    /// selection; the second, on the view rebuilt, opens it — with the
+    /// view's state carried over, as iced carries it.
+    #[test]
+    fn a_second_click_opens_the_folder_the_first_selected() {
+        assert!(second_click_opens(Duration::ZERO));
+    }
+
+    /// The same with the pointer resting on the row first. The list
+    /// stamps a press with the time of the last frame, not its own, so
+    /// this needs a third click: reported upstream, with a reproducer.
+    #[test]
+    #[ignore = "libadwaita-iced: list_view stamps a press with the last frame's time"]
+    fn a_second_click_opens_the_folder_after_the_pointer_rested() {
+        assert!(second_click_opens(
+            list_view::DOUBLE_CLICK + Duration::from_millis(100)
+        ));
+    }
+
+    fn second_click_opens(rest: Duration) -> bool {
+        let entries = || vec![entry("Docs", Kind::Folder), entry("Notes.md", Kind::File)];
+        let before = showing(entries());
+        let mut after = showing(entries());
+        let theme = before.theme();
+
+        let mut ui = Simulator::with_size(typography::settings(), (960.0, 640.0), before.view());
+        ui.draw(&theme);
+        std::thread::sleep(rest);
+        click_first_row(&mut ui);
+        let messages: Vec<Message> = ui.drain().collect();
+        assert!(
+            messages
+                .iter()
+                .any(|message| matches!(message, Message::Selected(..))),
+            "the first click selects: {messages:?}"
+        );
+        for message in messages {
+            let _ = after.update(message);
+        }
+
+        let mut ui = ui.rebuild(after.view());
+        ui.draw(&theme);
+        click_first_row(&mut ui);
+        ui.drain()
+            .any(|message| matches!(message, Message::Activated(_, 0)))
+    }
 
     fn upload(uploaded: u64, skipped: u64, failures: &[(&str, Option<&str>)]) -> Transfer {
         Transfer {

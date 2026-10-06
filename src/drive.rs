@@ -31,6 +31,17 @@ pub struct Cli {
     source: Source,
 }
 
+impl Cli {
+    /// A CLI that is never run: for tests of what shows around it.
+    #[cfg(test)]
+    pub fn never_run() -> Self {
+        Self {
+            program: PathBuf::from("/nonexistent/proton-drive"),
+            source: Source::Settings,
+        }
+    }
+}
+
 /// Where the CLI in use was found.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Source {
