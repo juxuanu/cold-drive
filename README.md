@@ -51,9 +51,13 @@ RUST_LOG=cold_drive=debug cargo run
 
 ## How it works
 
-Each action runs one `proton-drive … --json` command and parses its output.
-Nodes are addressed as `/my-files/<uid>`, which the CLI resolves with a direct
-lookup, so deep folders don't need a name lookup at every level.
+The quick commands — listings, info, sharing, trash, rename, copy, move —
+go to the CLI's own interactive shell (`proton-drive` with no arguments),
+kept running and given one `… --json` line at a time, so the CLI starts and
+opens its cache once. Uploads, downloads and signing in run as commands of
+their own, since they run long and are killed to cancel. Nodes are addressed
+as `/my-files/<uid>`, which the CLI resolves with a direct lookup, so deep
+folders don't need a name lookup at every level.
 
 Opened files are downloaded, decrypted, into `$XDG_CACHE_HOME/cold-drive/files`,
 one directory per revision. That directory is wiped at startup and at log-out.
