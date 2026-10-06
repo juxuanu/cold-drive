@@ -2493,7 +2493,7 @@ impl App {
                         Message::Paste(page.tag.clone()),
                         backdrop,
                     );
-                    let menu = adw::context_menu(container(view))
+                    let menu = adw::context_menu(container(view).width(Fill).height(Fill))
                         .push(
                             item("New Folder…")
                                 .accelerator("Ctrl+N")
