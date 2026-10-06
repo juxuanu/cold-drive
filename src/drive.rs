@@ -9,6 +9,7 @@
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use iced::futures::{SinkExt, Stream};
@@ -25,31 +26,26 @@ const CLI_NAMES: &[&str] = &["proton-drive", "proton-drive-cli"];
 /// What the CLI prints, on stderr, for a command that needs a session.
 const AUTH_REQUIRED: &str = "You need to login first";
 
-/// How many times a CLI that found its cache locked is started again,
-/// and how long the first wait is; each later one is a step longer.
-const CACHE_LOCKED_RETRIES: u32 = 3;
-const CACHE_LOCKED_WAIT: Duration = Duration::from_millis(250);
-
-/// Whether the CLI failed to open its SQLite cache because another CLI
-/// had it: Bun's `SQLiteError: database is locked`, `SQLITE_BUSY_RECOVERY`.
-fn cache_locked(said: &str) -> bool {
-    said.contains("SQLITE_BUSY") || said.contains("database is locked")
-}
+/// How long a CLI is given to start before the next one may: it opens
+/// its SQLite cache as it starts, and two opening it together fail with
+/// `SQLITE_BUSY_RECOVERY`, "database is locked", before either has done
+/// anything. Starting takes under half a second; what runs after — a
+/// listing, a transfer — shares the cache fine, so only the starts queue.
+const START: Duration = Duration::from_secs(1);
 
 #[derive(Debug, Clone)]
 pub struct Cli {
     program: PathBuf,
     source: Source,
+    /// Held while a CLI starts: see [`START`].
+    lane: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl Cli {
     /// A CLI that is never run: for tests of what shows around it.
     #[cfg(test)]
     pub fn never_run() -> Self {
-        Self {
-            program: PathBuf::from("/nonexistent/proton-drive"),
-            source: Source::Settings,
-        }
+        Self::found(PathBuf::from("/nonexistent/proton-drive"), Source::Settings)
     }
 }
 
@@ -183,7 +179,11 @@ impl Cli {
 
     fn found(program: PathBuf, source: Source) -> Self {
         tracing::info!(program = %program.display(), ?source, "using the Proton Drive CLI");
-        Self { program, source }
+        Self {
+            program,
+            source,
+            lane: Arc::default(),
+        }
     }
 
     pub fn program(&self) -> &Path {
@@ -744,40 +744,43 @@ impl Cli {
         let mut command = self.command(args);
         let line = describe(&command);
 
-        let mut attempt = 0;
-        loop {
-            tracing::debug!(command = %line, "running");
-            let started = Instant::now();
-            let output = command.output().await.inspect_err(|error| {
-                tracing::error!(command = %line, %error, "could not run the CLI");
-            })?;
-            let elapsed = started.elapsed();
-            let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
-            let stderr = String::from_utf8_lossy(&output.stderr);
+        // One CLI starts at a time: the lane is held from the spawn until
+        // the CLI has had [`START`] to open its cache, or has finished.
+        let starting = self.lane.lock().await;
+        tracing::debug!(command = %line, "running");
+        let started = Instant::now();
+        let child = command.spawn().inspect_err(|error| {
+            tracing::error!(command = %line, %error, "could not run the CLI");
+        })?;
+        let finishing = child.wait_with_output();
+        tokio::pin!(finishing);
+        let early = tokio::select! {
+            output = &mut finishing => Some(output),
+            () = tokio::time::sleep(START) => None,
+        };
+        drop(starting);
+        let output = match early {
+            Some(output) => output,
+            None => finishing.await,
+        }
+        .inspect_err(|error| {
+            tracing::error!(command = %line, %error, "could not wait for the CLI");
+        })?;
 
-            if output.status.success() {
-                tracing::info!(command = %line, ?elapsed, bytes = stdout.len(), "done");
-                if !stderr.trim().is_empty() {
-                    tracing::debug!(command = %line, stderr = %stderr.trim(), "the CLI said");
-                }
-                return Ok((stdout, Ok(())));
+        let elapsed = started.elapsed();
+        let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+
+        if output.status.success() {
+            tracing::info!(command = %line, ?elapsed, bytes = stdout.len(), "done");
+            if !stderr.trim().is_empty() {
+                tracing::debug!(command = %line, stderr = %stderr.trim(), "the CLI said");
             }
-
+            Ok((stdout, Ok(())))
+        } else {
             // What it said on either stream: a runtime's banner of `=`
             // may land on one and the error on the other.
             let said = format!("{}\n{}", stderr.trim(), stdout.trim());
-
-            // Two CLIs starting at once contend for the SQLite cache the
-            // CLI opens as it starts — `SQLITE_BUSY_RECOVERY`, before the
-            // command has done anything — so the start is tried again.
-            if attempt < CACHE_LOCKED_RETRIES && cache_locked(&said) {
-                attempt += 1;
-                let wait = CACHE_LOCKED_WAIT * attempt;
-                tracing::info!(command = %line, attempt, ?wait, "the CLI's cache was locked");
-                tokio::time::sleep(wait).await;
-                continue;
-            }
-
             tracing::warn!(
                 command = %line,
                 ?elapsed,
@@ -787,7 +790,7 @@ impl Cli {
                 "failed",
             );
             let failure = failure(&said, output.status);
-            return Ok((stdout, Err(failure)));
+            Ok((stdout, Err(failure)))
         }
     }
 }
@@ -1433,7 +1436,6 @@ SQLiteError: database is locked\n\
             failure(bun, status),
             Error::Failed("database is locked".to_owned())
         );
-        assert!(cache_locked(bun));
         assert_eq!(
             failure(
                 "error: Cannot specify name when copying multiple files",
@@ -1445,7 +1447,6 @@ SQLiteError: database is locked\n\
             failure("====\nSomething odd\n", status),
             Error::Failed("Something odd".to_owned())
         );
-        assert!(!cache_locked("Something odd"));
     }
 
     #[test]
