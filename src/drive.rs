@@ -414,19 +414,33 @@ impl Cli {
     /// Moves `entries` to the trash.
     pub async fn trash(self, entries: Vec<Entry>) -> Result<Done, Error> {
         let paths = entries.iter().map(|entry| entry.path.clone()).collect();
-        self.node_op("trash", paths, &entries).await
+        self.node_op("trash", paths, None, &entries).await
     }
 
     /// Restores `entries` from the trash.
     pub async fn restore(self, entries: Vec<Entry>) -> Result<Done, Error> {
         let paths = entries.iter().map(Entry::trash_path).collect();
-        self.node_op("restore", paths, &entries).await
+        self.node_op("restore", paths, None, &entries).await
     }
 
     /// Deletes `entries`, which are in the trash, for good.
     pub async fn delete(self, entries: Vec<Entry>) -> Result<Done, Error> {
         let paths = entries.iter().map(Entry::trash_path).collect();
-        self.node_op("delete", paths, &entries).await
+        self.node_op("delete", paths, None, &entries).await
+    }
+
+    /// Copies the entries into the folder at `target`. The CLI copies
+    /// across My Files, Computers and Shared with Me; a name already taken
+    /// in the target fails that entry.
+    pub async fn copy(self, entries: Vec<Entry>, target: String) -> Result<Done, Error> {
+        let paths = entries.iter().map(|entry| entry.path.clone()).collect();
+        self.node_op("copy", paths, Some(target), &entries).await
+    }
+
+    /// Moves the entries into the folder at `target`, within the account.
+    pub async fn move_to(self, entries: Vec<Entry>, target: String) -> Result<Done, Error> {
+        let paths = entries.iter().map(|entry| entry.path.clone()).collect();
+        self.node_op("move", paths, Some(target), &entries).await
     }
 
     /// Deletes everything in the trash for good. The CLI starts it and
@@ -437,18 +451,21 @@ impl Cli {
             .map(|_| ())
     }
 
-    /// Runs `filesystem <command>` over `paths`, and reads the result it
-    /// prints for each node, named after `entries`.
+    /// Runs `filesystem <command>` over `paths` — and `target` after them,
+    /// for copy and move — and reads the result it prints for each node,
+    /// named after `entries`.
     async fn node_op(
         &self,
         command: &str,
         paths: Vec<String>,
+        target: Option<String>,
         entries: &[Entry],
     ) -> Result<Done, Error> {
         let mut args: Vec<OsString> = ["filesystem", command, "--json", "--"]
             .map(OsString::from)
             .into();
         args.extend(paths.into_iter().map(OsString::from));
+        args.extend(target.map(OsString::from));
 
         let stdout = self.run(args).await?;
         let results: Vec<NodeResult> = parse_json(&stdout)?;

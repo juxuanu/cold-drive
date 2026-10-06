@@ -89,8 +89,21 @@ pub struct App {
     naming: Option<Naming>,
     /// What the Delete alert is about: the page, and the items.
     deleting: Option<(String, Vec<Entry>)>,
+    /// What Copy or Cut took, for Paste.
+    clipboard: Option<Clipboard>,
     share: Option<Share>,
     info: Option<Info>,
+}
+
+/// What Copy or Cut took: the items, and whether Paste moves them — Files'
+/// clipboard, kept here since the items are nodes of the account, not
+/// files of the system.
+#[derive(Debug, Clone)]
+struct Clipboard {
+    entries: Vec<Entry>,
+    cut: bool,
+    /// The folder they are in, for the operation's details.
+    from: String,
 }
 
 /// The item the Info dialog is about.
@@ -315,6 +328,22 @@ pub enum Message {
     TrashEmptied(u64, Result<(), drive::Error>),
     /// Delete: the trash on a folder page, for good in the trash.
     DeleteSelected,
+    /// Copy or cut the selection on the page: Paste then copies or moves it.
+    Copy(String),
+    Cut(String),
+    /// Ctrl+C and Ctrl+X, on the folder on top.
+    CopySelected,
+    CutSelected,
+    /// Paste into the folder page; Ctrl+V, into the one on top.
+    Paste(String),
+    PasteHere,
+    /// Paste into a folder on the page, by UID.
+    PasteInto(String, String),
+    /// The page to list again, the names to select on it, whether it was
+    /// a move, and how it went.
+    Pasted(u64, String, Vec<String>, bool, Result<Done, drive::Error>),
+    /// Select every row shown on the page.
+    SelectAll(String),
     /// Open the Share dialog on the item.
     ShareIn(String, String),
     /// Leave the item shared with the account.
@@ -423,6 +452,7 @@ impl App {
             about_pages: Vec::new(),
             naming: None,
             deleting: None,
+            clipboard: None,
             share: None,
             operations: Vec::new(),
             next_operation: 0,
@@ -461,6 +491,9 @@ impl App {
                     Key::Character("r") if modifiers.command() => Some(Message::RefreshTop),
                     Key::Character("u") if modifiers.command() => Some(Message::UploadHere),
                     Key::Character("n") if modifiers.command() => Some(Message::NewFolderHere),
+                    Key::Character("c") if modifiers.command() => Some(Message::CopySelected),
+                    Key::Character("x") if modifiers.command() => Some(Message::CutSelected),
+                    Key::Character("v") if modifiers.command() => Some(Message::PasteHere),
                     Key::Named(Named::F2) => Some(Message::RenameSelected),
                     Key::Named(Named::Delete) => Some(Message::DeleteSelected),
                     Key::Character(",") if modifiers.command() => {
@@ -1059,6 +1092,75 @@ impl App {
                     Err(error) => self.toast(format!("Could not delete: {error}")),
                 }
                 return self.load(&tag);
+            }
+            Message::Copy(tag) => self.take(&tag, false),
+            Message::Cut(tag) => self.take(&tag, true),
+            Message::CopySelected => {
+                if self.dialog.is_none()
+                    && let Some((tag, _)) = self.top_folder()
+                {
+                    self.take(&tag, false);
+                }
+            }
+            Message::CutSelected => {
+                if self.dialog.is_none()
+                    && let Some((tag, _)) = self.top_folder()
+                {
+                    self.take(&tag, true);
+                }
+            }
+            Message::Paste(tag) => {
+                let Some((target, into)) = self
+                    .folder_mut(&tag)
+                    .map(|folder| (folder.path.clone(), folder.title.clone()))
+                else {
+                    return Task::none();
+                };
+                return self.paste(tag, target, into, true);
+            }
+            Message::PasteHere => {
+                if self.dialog.is_none()
+                    && let Some(tag) = self.writable_top()
+                {
+                    return self.update(Message::Paste(tag));
+                }
+            }
+            Message::PasteInto(tag, uid) => {
+                let Some((target, into)) = self.folder_mut(&tag).and_then(|folder| {
+                    folder
+                        .entry(&uid)
+                        .map(|entry| (entry.path.clone(), entry.name.clone()))
+                }) else {
+                    return Task::none();
+                };
+                return self.paste(tag, target, into, false);
+            }
+            Message::Pasted(operation, tag, names, cut, result) => {
+                self.finish(operation);
+                let verb = if cut { "move" } else { "copy" };
+                match result {
+                    Ok(done) if done.failed.is_empty() => {
+                        tracing::info!(count = done.done, cut, "pasted");
+                        // What was moved is where it was pasted, and only
+                        // there: Files' clipboard empties too.
+                        if cut {
+                            self.clipboard = None;
+                        }
+                        if let Some(folder) = self.folder_mut(&tag) {
+                            folder.select_next = names;
+                        }
+                    }
+                    Ok(done) => self.toast(failed(verb, "", &done)),
+                    Err(drive::Error::AuthRequired) => self.signed_out = true,
+                    Err(error) => self.toast(format!("Could not {verb}: {error}")),
+                }
+                return self.load(&tag);
+            }
+            Message::SelectAll(tag) => {
+                if let Some(folder) = self.folder_mut(&tag) {
+                    let all = (0..folder.shown().len()).collect();
+                    folder.selected = Selection::Multiple(all);
+                }
             }
             Message::ConfirmEmptyTrash => {
                 self.dialog = Some(Dialog::EmptyTrash);
@@ -1759,6 +1861,72 @@ impl App {
             .map(|page| page.tag.clone())
     }
 
+    /// Copy or Cut: the selection on the page goes to the clipboard, for
+    /// Paste to copy or to move.
+    fn take(&mut self, tag: &str, cut: bool) {
+        // The trash's items are restored, not copied: the CLI copies from
+        // My Files, Computers and Shared with Me only.
+        if self.section == Section::Trash {
+            return;
+        }
+        let Some((entries, from)) = self
+            .folder_mut(tag)
+            .map(|folder| {
+                (
+                    folder
+                        .selected_entries()
+                        .into_iter()
+                        .cloned()
+                        .collect::<Vec<_>>(),
+                    folder.title.clone(),
+                )
+            })
+            .filter(|(entries, _)| !entries.is_empty())
+        else {
+            return;
+        };
+
+        tracing::info!(count = entries.len(), cut, "taken for pasting");
+        self.clipboard = Some(Clipboard { entries, cut, from });
+    }
+
+    /// Paste: the clipboard's items are copied, or moved, into the folder
+    /// at `target`, named `into`, and the page `tag` is listed again —
+    /// with them selected, when `select` says they will be among its rows.
+    fn paste(&mut self, tag: String, target: String, into: String, select: bool) -> Task<Message> {
+        let Some(cli) = self.cli.clone() else {
+            return Task::none();
+        };
+        let Some(Clipboard { entries, cut, from }) = self.clipboard.clone() else {
+            return Task::none();
+        };
+        let names: Vec<String> = if select {
+            entries.iter().map(|entry| entry.name.clone()).collect()
+        } else {
+            Vec::new()
+        };
+
+        let verb = if cut { "Moving" } else { "Copying" };
+        let operation = self.begin(
+            format!("{verb} {}", describe(&entries)),
+            format!("From {from} to {into}"),
+            &tag,
+            false,
+        );
+        tracing::info!(count = entries.len(), cut, "pasting");
+        let future = async move {
+            if cut {
+                cli.move_to(entries, target).await
+            } else {
+                cli.copy(entries, target).await
+            }
+        };
+        let task = Task::perform(future, move |result| {
+            Message::Pasted(operation, tag.clone(), names.clone(), cut, result)
+        });
+        self.track(operation, task)
+    }
+
     fn upload(&mut self, tag: &str, files: Vec<PathBuf>) -> Task<Message> {
         let Some(cli) = self.cli.clone() else {
             return Task::none();
@@ -2234,6 +2402,37 @@ impl App {
                 }
 
                 let view = self.folder(&page.tag, folder);
+                let view: Element<'_, Message> = if folder.writable {
+                    // Files' background menu: a secondary press on the view
+                    // where no row is — a row takes the press for its own
+                    // menu first.
+                    let paste = self
+                        .clipboard
+                        .as_ref()
+                        .map(|_| Message::Paste(page.tag.clone()));
+                    adw::context_menu(container(view))
+                        .push(
+                            item("New Folder…")
+                                .accelerator("Ctrl+N")
+                                .on_activate(Message::NewFolderIn(page.tag.clone())),
+                        )
+                        .push(
+                            item("Upload Files…")
+                                .accelerator("Ctrl+U")
+                                .on_activate(Message::UploadTo(page.tag.clone())),
+                        )
+                        .push(separator())
+                        .push(item("Paste").accelerator("Ctrl+V").on_activate_maybe(paste))
+                        .push(separator())
+                        .push(
+                            item("Select All")
+                                .accelerator("Ctrl+A")
+                                .on_activate(Message::SelectAll(page.tag.clone())),
+                        )
+                        .boxed()
+                } else {
+                    view
+                };
                 let view: Element<'_, Message> = if self.section == Section::Trash {
                     // Files' trash bar: a banner over the view with the
                     // way to empty it. With nothing listed there is
@@ -2500,6 +2699,12 @@ impl App {
                     .on_activate(Message::Download(tag.to_owned()))
                     .into(),
             );
+            entries.push(
+                item("Copy")
+                    .accelerator("Ctrl+C")
+                    .on_activate(Message::Copy(tag.to_owned()))
+                    .into(),
+            );
             entries.push(separator());
             entries.push(
                 item("Leave")
@@ -2550,6 +2755,28 @@ impl App {
                         .on_activate(Message::ShareIn(tag.to_owned(), entry.uid.clone()))
                         .into(),
                 );
+            }
+            entries.push(separator());
+            entries.push(
+                item("Cut")
+                    .accelerator("Ctrl+X")
+                    .on_activate(Message::Cut(tag.to_owned()))
+                    .into(),
+            );
+            entries.push(
+                item("Copy")
+                    .accelerator("Ctrl+C")
+                    .on_activate(Message::Copy(tag.to_owned()))
+                    .into(),
+            );
+            if matches!(entry.kind, Kind::Folder) {
+                // Files' "Paste Into Folder", sensitive with something
+                // to paste.
+                let paste = self
+                    .clipboard
+                    .as_ref()
+                    .map(|_| Message::PasteInto(tag.to_owned(), entry.uid.clone()));
+                entries.push(item("Paste Into Folder").on_activate_maybe(paste).into());
             }
             entries.push(separator());
             entries.push(

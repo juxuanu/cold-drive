@@ -513,6 +513,9 @@ fn shortcuts() -> Element<'static, Message> {
             shortcuts_section("Files")
                 .item(shortcuts_item("Upload Files", "<Control>u"))
                 .item(shortcuts_item("New Folder", "<Control>n"))
+                .item(shortcuts_item("Copy the Selection", "<Control>c"))
+                .item(shortcuts_item("Cut the Selection", "<Control>x"))
+                .item(shortcuts_item("Paste", "<Control>v").subtitle("Into the folder shown"))
                 .item(shortcuts_item("Rename the Selected Item", "F2"))
                 .item(
                     shortcuts_item("Move the Selection to Trash", "Delete")
