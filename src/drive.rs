@@ -749,19 +749,18 @@ impl Cli {
             }
             Ok((stdout, Ok(())))
         } else {
-            let said = if stderr.trim().is_empty() {
-                &stdout
-            } else {
-                &*stderr
-            };
+            // What it said on either stream: a runtime's banner of `=`
+            // may land on one and the error on the other.
+            let said = format!("{}\n{}", stderr.trim(), stdout.trim());
             tracing::warn!(
                 command = %line,
                 ?elapsed,
                 status = %output.status,
-                output = %said.trim(),
+                stderr = %stderr.trim(),
+                stdout = %stdout.trim(),
                 "failed",
             );
-            let failure = failure(said, output.status);
+            let failure = failure(&said, output.status);
             Ok((stdout, Err(failure)))
         }
     }
