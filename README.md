@@ -1,4 +1,4 @@
-# Cold Pass
+# Cold Drive
 
 A GNOME-style Proton Drive browser, built with
 [libadwaita-iced](https://gitlab.com/juxuanu/libadwaita-iced) on top of the
@@ -27,7 +27,7 @@ official [Proton Drive CLI](https://github.com/ProtonDriveApps/sdk/blob/main/cli
 ## Requirements
 
 Install `proton-drive` from <https://proton.me/download/drive/cli> and put it
-on your `PATH`, or set its path in the preferences. `COLD_PASS_DRIVE_CLI`
+on your `PATH`, or set its path in the preferences. `COLD_DRIVE_DRIVE_CLI`
 overrides both.
 
 ```sh
@@ -37,10 +37,10 @@ cargo run --release
 ## Logging
 
 Logs go to stderr: every CLI call with its duration, and failures with what
-the CLI said. `RUST_LOG` sets the level, `info` for Cold Pass by default:
+the CLI said. `RUST_LOG` sets the level, `info` for Cold Drive by default:
 
 ```sh
-RUST_LOG=cold_pass=debug cargo run
+RUST_LOG=cold_drive=debug cargo run
 ```
 
 ## How it works
@@ -49,5 +49,5 @@ Each action runs one `proton-drive … --json` command and parses its output.
 Nodes are addressed as `/my-files/<uid>`, which the CLI resolves with a direct
 lookup, so deep folders don't need a name lookup at every level.
 
-Opened files are downloaded, decrypted, into `$XDG_CACHE_HOME/cold-pass/files`,
+Opened files are downloaded, decrypted, into `$XDG_CACHE_HOME/cold-drive/files`,
 one directory per revision. That directory is wiped at startup and at log-out.

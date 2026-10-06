@@ -71,7 +71,7 @@ impl Config {
 }
 
 fn path() -> Option<PathBuf> {
-    Some(dirs::config_dir()?.join("cold-pass").join("config.json"))
+    Some(dirs::config_dir()?.join("cold-drive").join("config.json"))
 }
 
 #[cfg(test)]

@@ -23,7 +23,7 @@ use crate::{files, format};
 /// The naming dialog's entry, focused as the dialog opens.
 pub(super) const NAME_ENTRY: &str = "name-entry";
 
-const REPOSITORY: &str = "https://github.com/juxuanu/cold-pass";
+const REPOSITORY: &str = "https://github.com/juxuanu/cold-drive";
 
 impl App {
     pub(super) fn dialog_view(&self, which: Dialog) -> Element<'_, Message> {
@@ -88,7 +88,7 @@ impl App {
         let mut group = preferences_group()
             .title("Proton Drive CLI")
             .description(
-                "Cold Pass runs the official Proton Drive CLI for everything it does. Leave the \
+                "Cold Drive runs the official Proton Drive CLI for everything it does. Leave the \
                  path empty to use the one on PATH.",
             )
             .push(path);
@@ -445,7 +445,7 @@ impl App {
             _ => "unknown",
         };
         let debug_info = format!(
-            "Cold Pass {}\nCLI: {cli}\nCLI version: {version}\nOS: {} {}\n",
+            "Cold Drive {}\nCLI: {cli}\nCLI version: {version}\nOS: {} {}\n",
             env!("CARGO_PKG_VERSION"),
             std::env::consts::OS,
             std::env::consts::ARCH,
@@ -453,7 +453,7 @@ impl App {
 
         about_dialog::about_dialog()
             .application_icon(icons::folder_remote())
-            .application_name("Cold Pass")
+            .application_name("Cold Drive")
             .developer_name("juxuanu")
             .version(env!("CARGO_PKG_VERSION"))
             .comments(

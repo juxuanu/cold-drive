@@ -1,4 +1,4 @@
-//! Cold Pass: a GNOME-style browser for Proton Drive, over the official
+//! Cold Drive: a GNOME-style browser for Proton Drive, over the official
 //! `proton-drive` command-line client.
 
 mod app;
@@ -17,7 +17,7 @@ use tracing_subscriber::EnvFilter;
 /// decoration frame on Wayland even with decorations off, only to hide it,
 /// and the frame warns about every button in GNOME's `button-layout` it does
 /// not draw, such as `icon`.
-const DEFAULT_LOG: &str = "warn,sctk_adwaita=error,cold_pass=info";
+const DEFAULT_LOG: &str = "warn,sctk_adwaita=error,cold_drive=info";
 
 fn main() -> iced::Result {
     tracing_subscriber::fmt()
@@ -28,12 +28,12 @@ fn main() -> iced::Result {
         .with_ansi(std::io::stderr().is_terminal())
         .init();
 
-    tracing::info!(version = env!("CARGO_PKG_VERSION"), "starting Cold Pass");
+    tracing::info!(version = env!("CARGO_PKG_VERSION"), "starting Cold Drive");
     typography::set_monospace(typography::FONT_MONO);
 
     iced::application(app::App::new, app::App::update, app::App::view)
         .settings(typography::settings())
-        .title("Cold Pass")
+        .title("Cold Drive")
         .subscription(app::App::subscription)
         .theme(app::App::theme)
         .window_size((960.0, 640.0))

@@ -220,7 +220,7 @@ pub fn cache_dir(entry: &Entry) -> PathBuf {
 pub fn cache_dir_root() -> PathBuf {
     dirs::cache_dir()
         .unwrap_or_else(std::env::temp_dir)
-        .join("cold-pass")
+        .join("cold-drive")
         .join("files")
 }
 

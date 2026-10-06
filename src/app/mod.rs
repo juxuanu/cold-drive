@@ -2113,7 +2113,7 @@ impl App {
                     .accelerator("Ctrl+?")
                     .on_activate(Message::ShowDialog(Dialog::Shortcuts)),
             )
-            .push(item("About Cold Pass").on_activate(Message::ShowDialog(Dialog::About)))
+            .push(item("About Cold Drive").on_activate(Message::ShowDialog(Dialog::About)))
             .boxed()
     }
 
@@ -2629,7 +2629,7 @@ impl App {
     }
 
     fn missing_cli(&self) -> Element<'_, Message> {
-        let mut description = "Cold Pass browses Proton Drive through its command-line client. \
+        let mut description = "Cold Drive browses Proton Drive through its command-line client. \
                                Install it and put proton-drive on your PATH, or set its path."
             .to_owned();
         if std::env::var_os(drive::CLI_ENV).is_some_and(|value| !value.is_empty()) {
@@ -2707,7 +2707,7 @@ impl App {
         toolbar_view(content)
             .top(
                 header_bar()
-                    .title(window_title("Cold Pass").backdrop(backdrop))
+                    .title(window_title("Cold Drive").backdrop(backdrop))
                     .on_window(Message::Window)
                     .maximized(self.maximized)
                     .backdrop(backdrop),
