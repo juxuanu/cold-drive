@@ -9,7 +9,7 @@
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use iced::futures::{SinkExt, Stream};
 use serde::Deserialize;
@@ -24,6 +24,17 @@ const CLI_NAMES: &[&str] = &["proton-drive", "proton-drive-cli"];
 
 /// What the CLI prints, on stderr, for a command that needs a session.
 const AUTH_REQUIRED: &str = "You need to login first";
+
+/// How many times a CLI that found its cache locked is started again,
+/// and how long the first wait is; each later one is a step longer.
+const CACHE_LOCKED_RETRIES: u32 = 3;
+const CACHE_LOCKED_WAIT: Duration = Duration::from_millis(250);
+
+/// Whether the CLI failed to open its SQLite cache because another CLI
+/// had it: Bun's `SQLiteError: database is locked`, `SQLITE_BUSY_RECOVERY`.
+fn cache_locked(said: &str) -> bool {
+    said.contains("SQLITE_BUSY") || said.contains("database is locked")
+}
 
 #[derive(Debug, Clone)]
 pub struct Cli {
@@ -66,7 +77,7 @@ pub struct Usage {
     pub items: u64,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Error {
     /// There is no session; `auth login` first.
     AuthRequired,
@@ -732,26 +743,41 @@ impl Cli {
     {
         let mut command = self.command(args);
         let line = describe(&command);
-        tracing::debug!(command = %line, "running");
 
-        let started = Instant::now();
-        let output = command.output().await.inspect_err(|error| {
-            tracing::error!(command = %line, %error, "could not run the CLI");
-        })?;
-        let elapsed = started.elapsed();
-        let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
-        let stderr = String::from_utf8_lossy(&output.stderr);
+        let mut attempt = 0;
+        loop {
+            tracing::debug!(command = %line, "running");
+            let started = Instant::now();
+            let output = command.output().await.inspect_err(|error| {
+                tracing::error!(command = %line, %error, "could not run the CLI");
+            })?;
+            let elapsed = started.elapsed();
+            let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+            let stderr = String::from_utf8_lossy(&output.stderr);
 
-        if output.status.success() {
-            tracing::info!(command = %line, ?elapsed, bytes = stdout.len(), "done");
-            if !stderr.trim().is_empty() {
-                tracing::debug!(command = %line, stderr = %stderr.trim(), "the CLI said");
+            if output.status.success() {
+                tracing::info!(command = %line, ?elapsed, bytes = stdout.len(), "done");
+                if !stderr.trim().is_empty() {
+                    tracing::debug!(command = %line, stderr = %stderr.trim(), "the CLI said");
+                }
+                return Ok((stdout, Ok(())));
             }
-            Ok((stdout, Ok(())))
-        } else {
+
             // What it said on either stream: a runtime's banner of `=`
             // may land on one and the error on the other.
             let said = format!("{}\n{}", stderr.trim(), stdout.trim());
+
+            // Two CLIs starting at once contend for the SQLite cache the
+            // CLI opens as it starts — `SQLITE_BUSY_RECOVERY`, before the
+            // command has done anything — so the start is tried again.
+            if attempt < CACHE_LOCKED_RETRIES && cache_locked(&said) {
+                attempt += 1;
+                let wait = CACHE_LOCKED_WAIT * attempt;
+                tracing::info!(command = %line, attempt, ?wait, "the CLI's cache was locked");
+                tokio::time::sleep(wait).await;
+                continue;
+            }
+
             tracing::warn!(
                 command = %line,
                 ?elapsed,
@@ -761,7 +787,7 @@ impl Cli {
                 "failed",
             );
             let failure = failure(&said, output.status);
-            Ok((stdout, Err(failure)))
+            return Ok((stdout, Err(failure)));
         }
     }
 }
@@ -812,13 +838,22 @@ fn failure(said: &str, status: std::process::ExitStatus) -> Error {
         return Error::AuthRequired;
     }
 
-    // An uncaught error prints a banner of `=` and a stack trace; the
-    // message is the first line that is neither.
-    let message = said
-        .lines()
-        .map(str::trim)
-        .find(|line| !line.is_empty() && !line.chars().all(|c| c == '='))
-        .map(|line| line.trim_start_matches("error: ").to_owned());
+    // An uncaught error prints a banner of `=`, the source around the
+    // throw, and a stack trace. The message is the `SomeError: …` line,
+    // or else the first line that is none of those.
+    let lines = said.lines().map(str::trim);
+    let message = lines
+        .clone()
+        .find_map(|line| {
+            let (kind, message) = line.split_once(": ")?;
+            (kind.ends_with("Error") || kind == "error").then(|| message.trim().to_owned())
+        })
+        .or_else(|| {
+            lines
+                .clone()
+                .find(|line| !line.is_empty() && !line.chars().all(|c| c == '='))
+                .map(str::to_owned)
+        });
 
     Error::Failed(message.unwrap_or_else(|| format!("The CLI exited with {status}")))
 }
@@ -1385,6 +1420,35 @@ mod tests {
     use super::*;
 
     #[test]
+    fn the_error_line_is_the_message() {
+        let bun = "================================================\n\
+7 | export class SQLiteCache implements ProtonDriveCache<string> {\n\
+12 |         this.db.run(`PRAGMA journal_mode = WAL`);\n\
+                     ^\n\
+SQLiteError: database is locked\n\
+      errno: 261,\n\
+      at run (bun:sqlite:336:21)";
+        let status = std::process::ExitStatus::default();
+        assert_eq!(
+            failure(bun, status),
+            Error::Failed("database is locked".to_owned())
+        );
+        assert!(cache_locked(bun));
+        assert_eq!(
+            failure(
+                "error: Cannot specify name when copying multiple files",
+                status
+            ),
+            Error::Failed("Cannot specify name when copying multiple files".to_owned())
+        );
+        assert_eq!(
+            failure("====\nSomething odd\n", status),
+            Error::Failed("Something odd".to_owned())
+        );
+        assert!(!cache_locked("Something odd"));
+    }
+
+    #[test]
     fn reasons_come_from_error_names() {
         assert_eq!(reason_for(NAME_TAKEN), "the name is already taken there");
         assert_eq!(reason_for("InvalidNameValidationError"), "invalid name");
@@ -1489,7 +1553,7 @@ mod tests {
         ));
         assert!(matches!(
             failure("=====\nValidationError: Node not found: x\n    at foo", status),
-            Error::Failed(message) if message == "ValidationError: Node not found: x"
+            Error::Failed(message) if message == "Node not found: x"
         ));
     }
 
