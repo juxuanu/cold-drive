@@ -17,7 +17,7 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 use tokio::process::Command;
 
 /// Overrides where the CLI is looked for.
-pub const CLI_ENV: &str = "COLD_DRIVE_DRIVE_CLI";
+pub const CLI_ENV: &str = "COLD_DRIVE_PROTON_DRIVE_CLI";
 
 /// The executable names the CLI ships under.
 const CLI_NAMES: &[&str] = &["proton-drive", "proton-drive-cli"];

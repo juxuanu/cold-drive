@@ -27,7 +27,7 @@ official [Proton Drive CLI](https://github.com/ProtonDriveApps/sdk/blob/main/cli
 ## Requirements
 
 Install `proton-drive` from <https://proton.me/download/drive/cli> and put it
-on your `PATH`, or set its path in the preferences. `COLD_DRIVE_DRIVE_CLI`
+on your `PATH`, or set its path in the preferences. `COLD_DRIVE_PROTON_DRIVE_CLI`
 overrides both.
 
 ```sh
