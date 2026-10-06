@@ -303,7 +303,7 @@ impl App {
                 if let Some(public) = public {
                     let copy = adw::icon_button(icons::edit_copy())
                         .style(adw::button::flat)
-                        .on_press(Message::CopyText(public.url.clone()));
+                        .on_press(Message::CopyText(public.url.clone(), "Link"));
                     let mut about = vec![format!("{} downloads", public.downloads)];
                     if let Some(expires) = public.expires.as_deref().and_then(format::full_date) {
                         about.push(format!("Expires {expires}"));
@@ -516,7 +516,7 @@ impl App {
             .on_pop(Message::AboutPop)
             .on_close(Message::CloseDialog)
             .on_activate_link(Message::OpenExternally)
-            .on_copy(Message::CopyText)
+            .on_copy(|text| Message::CopyText(text, "Debug information"))
             .toasts(&self.toasts, Message::ToastDismissed)
             .boxed()
     }

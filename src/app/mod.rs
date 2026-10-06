@@ -73,6 +73,9 @@ pub struct App {
     signed_out: bool,
     sign_in: Option<SignIn>,
     toasts: Toasts<Message>,
+    /// Never added to: the window's overlay shows these while a dialog
+    /// has the toasts.
+    no_toasts: Toasts<Message>,
     scheme: ColorScheme,
     focused: bool,
     maximized: bool,
@@ -404,8 +407,9 @@ pub enum Message {
     SignIn,
     Login(Login),
     CancelSignIn,
-    CopyText(String),
-    Copied,
+    /// Put the text on the clipboard, and say what it was: "Link".
+    CopyText(String, &'static str),
+    Copied(&'static str),
     LogOut,
     LoggedOut(Result<(), drive::Error>),
 
@@ -472,6 +476,7 @@ impl App {
             signed_out: false,
             sign_in: None,
             toasts: Toasts::new(),
+            no_toasts: Toasts::new(),
             scheme: ColorScheme::Light,
             focused: true,
             maximized: false,
@@ -1401,10 +1406,10 @@ impl App {
                 }
             }
             Message::CancelSignIn => self.sign_in = None,
-            Message::CopyText(text) => {
-                return iced::clipboard::write(text).map(|_| Message::Copied);
+            Message::CopyText(text, what) => {
+                return iced::clipboard::write(text).map(move |_| Message::Copied(what));
             }
-            Message::Copied => self.toast("Copied to clipboard".into()),
+            Message::Copied(what) => self.toast(format!("{what} copied")),
             Message::LogOut => {
                 if let Some(cli) = self.cli.clone() {
                     return Task::perform(cli.logout(), Message::LoggedOut);
@@ -1614,12 +1619,26 @@ impl App {
             .boxed(),
         };
 
-        let content = toast_overlay(content, &self.toasts).on_dismiss(Message::ToastDismissed);
+        // A toast shows over what is in front: in the dialog while one is
+        // open, as a dialog carries its own overlay in libadwaita, and in
+        // the window otherwise.
+        let toasts = if self.dialog.is_some() {
+            &self.no_toasts
+        } else {
+            &self.toasts
+        };
+        let content = toast_overlay(content, toasts).on_dismiss(Message::ToastDismissed);
 
-        let content = dialog(content, self.dialog.map(|which| self.dialog_view(which)))
-            .open(self.dialog_open)
-            .on_close(Message::CloseDialog)
-            .on_closed(Message::DialogClosed);
+        let content = dialog(
+            content,
+            self.dialog.map(|which| {
+                toast_overlay(self.dialog_view(which), &self.toasts)
+                    .on_dismiss(Message::ToastDismissed)
+            }),
+        )
+        .open(self.dialog_open)
+        .on_close(Message::CloseDialog)
+        .on_closed(Message::DialogClosed);
 
         adw::window(content)
             .on_window(Message::Window)
@@ -3024,7 +3043,7 @@ impl App {
                     adw::icon_text_button(icons::adw_external_link(), "Open Browser")
                         .on_press(Message::OpenExternally(url.clone())),
                     adw::icon_text_button(icons::edit_copy(), "Copy Link")
-                        .on_press(Message::CopyText(url.clone())),
+                        .on_press(Message::CopyText(url.clone(), "Sign-in link")),
                 ]
                 .spacing(12)
                 .boxed(),
