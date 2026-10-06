@@ -30,6 +30,21 @@ official [Proton Drive CLI](https://github.com/ProtonDriveApps/sdk/blob/main/cli
 - No thumbnails: the CLI cannot fetch the ones Proton stores, so files show
   their type's icon.
 
+## Download
+
+Every push to `main` builds the app on GitHub Actions for the three
+platforms and attaches the binaries to the rolling
+[latest build](https://github.com/juxuanu/cold-drive/releases/tag/latest), so
+these links always fetch the newest one:
+
+- [Linux (x86_64)](https://github.com/juxuanu/cold-drive/releases/download/latest/cold-drive-linux-x86_64)
+- [macOS (Apple silicon)](https://github.com/juxuanu/cold-drive/releases/download/latest/cold-drive-macos-arm64)
+- [Windows (x86_64)](https://github.com/juxuanu/cold-drive/releases/download/latest/cold-drive-windows-x86_64.exe)
+
+On Linux and macOS, mark the download executable with `chmod +x`. macOS also
+quarantines a downloaded binary; `xattr -d com.apple.quarantine cold-drive-macos-arm64`
+lets it run. The app needs the Proton Drive CLI installed; see Requirements.
+
 ## Requirements
 
 Install `proton-drive` from <https://proton.me/download/drive/cli> and put it
