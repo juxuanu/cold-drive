@@ -65,6 +65,9 @@ pub struct App {
     section: Section,
     /// Collapsed, whether the content is up rather than the sidebar.
     show_content: bool,
+    /// A section was just opened: its root page replaces the stack at
+    /// once, with no slide, until it reports itself shown.
+    switching: bool,
     /// The content's navigation stack, bottom first. Popped pages stay until
     /// they have slid out of view.
     pages: Vec<Page>,
@@ -363,6 +366,8 @@ pub enum Message {
     Pasted(u64, String, Vec<String>, bool, Result<Done, drive::Error>),
     /// Select every row shown on the page.
     SelectAll(String),
+    /// A section's root page is on; pushes slide again.
+    RootShown,
     /// Close the banner saying what was taken; the clipboard keeps it.
     DismissTaken,
     /// Open the Share dialog on the item.
@@ -474,6 +479,7 @@ impl App {
             config,
             section: Section::MyFiles,
             show_content: false,
+            switching: false,
             pages: Vec::new(),
             next_tag: 0,
             signed_out: false,
@@ -563,6 +569,7 @@ impl App {
                 return self.open_section(Section::ALL[index]);
             }
             Message::ContentShown(shown) => self.show_content = shown,
+            Message::RootShown => self.switching = false,
             Message::Listed(tag, result) => {
                 if let Some(folder) = self.folder_mut(&tag) {
                     folder.listing = match result {
@@ -1653,6 +1660,7 @@ impl App {
     fn open_section(&mut self, section: Section) -> Task<Message> {
         self.section = section;
         self.pages.clear();
+        self.switching = true;
 
         let tag = self.push(PageKind::Folder(Folder {
             title: section.title().into(),
@@ -2297,7 +2305,11 @@ impl App {
             )
             .backdrop(backdrop);
 
+        // Going to another section is not navigation: as Files changes
+        // the location in place, the new root is there at once, and only
+        // what is opened from it slides in.
         let stack = navigation_view()
+            .animate_transitions(!self.switching)
             .extend(
                 self.pages
                     .iter()
@@ -2583,9 +2595,13 @@ impl App {
             }
         };
 
-        navigation_page(page.tag.clone(), view)
+        let mut page = navigation_page(page.tag.clone(), view)
             .title(title)
-            .on_hidden(Message::PageHidden(page.tag.clone()))
+            .on_hidden(Message::PageHidden(page.tag.clone()));
+        if depth == 0 {
+            page = page.on_shown(Message::RootShown);
+        }
+        page
     }
 
     fn folder<'a>(&'a self, tag: &'a str, folder: &'a Folder) -> Element<'a, Message> {
