@@ -51,11 +51,11 @@ RUST_LOG=cold_drive=debug cargo run
 
 ## How it works
 
-Every command goes to the CLI's own interactive shell (`proton-drive` with
-no arguments), kept running and given one `… --json` line at a time, so the
-CLI starts and opens its cache once and never contends with itself. One
-command runs at a time, transfers included; cancelling one kills the shell,
-and the next command starts another. Nodes are addressed
+Every command but the transfers goes to the CLI's own interactive shell
+(`proton-drive` with no arguments), kept running and given one `… --json`
+line at a time, so the CLI starts and opens its cache once. Uploads and
+downloads run as commands of their own, so browsing goes on beside them and
+cancelling kills just that one. Nodes are addressed
 as `/my-files/<uid>`, which the CLI resolves with a direct lookup, so deep
 folders don't need a name lookup at every level.
 

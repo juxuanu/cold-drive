@@ -26,6 +26,26 @@ const CLI_NAMES: &[&str] = &["proton-drive", "proton-drive-cli"];
 /// What the CLI prints, on stderr, for a command that needs a session.
 const AUTH_REQUIRED: &str = "You need to login first";
 
+/// How long a CLI is given to start before the next one may: it opens
+/// its SQLite cache as it starts, and two opening it together fail with
+/// `SQLITE_BUSY_RECOVERY`, "database is locked", before either has done
+/// anything. Starting takes under half a second; what runs after shares the
+/// cache fine, so only the starts queue — a transfer's, and the shell's.
+const START: Duration = Duration::from_secs(1);
+
+/// Whether a command runs in a CLI of its own rather than the shell: the
+/// transfers, which run long — the shell would hold everything else up
+/// behind them — and are killed to cancel.
+fn runs_alone(args: &[OsString]) -> bool {
+    matches!(
+        (
+            args.first().and_then(|a| a.to_str()),
+            args.get(1).and_then(|a| a.to_str()),
+        ),
+        (Some("filesystem"), Some("upload" | "download"))
+    )
+}
+
 /// What the CLI writes to stderr without failing: a notice, once per
 /// process, that a newer version is wanted.
 const NOTICES: [&str; 3] = ["Update needed:", "Update required:", "Update recommended:"];
@@ -52,8 +72,10 @@ fn without_notices(stderr: &str) -> String {
 pub struct Cli {
     program: PathBuf,
     source: Source,
-    /// The CLI's own shell, kept running for the commands that are quick:
-    /// one start, one cache opened. See [`Shell`].
+    /// Held while a CLI starts: see [`START`].
+    lane: Arc<tokio::sync::Mutex<()>>,
+    /// The CLI's own shell, kept running for every command but the
+    /// transfers: one start, one cache opened. See [`Shell`].
     shell: Arc<tokio::sync::Mutex<Shells>>,
 }
 
@@ -97,11 +119,11 @@ impl Shells {
 
 /// `proton-drive` with no arguments: its interactive shell, which takes
 /// the same commands as its arguments, one per line at its prompt, and
-/// runs them in the one process — the only way the CLI is run. A
-/// command's output comes on stdout and then the prompt again; a
-/// failure's message comes on stderr, one line, and the prompt again.
-/// Commands run one at a time, a transfer included; a command dropped
+/// runs them in the one process. A command's output comes on stdout and
+/// then the prompt again; a failure's message comes on stderr, one line,
+/// and the prompt again. Commands run one at a time; a command dropped
 /// mid-way — cancelled — kills the shell, and the next starts another.
+/// The transfers run in a CLI of their own instead: see [`runs_alone`].
 struct Shell {
     child: Child,
     stdin: ChildStdin,
@@ -384,6 +406,7 @@ impl Cli {
         Self {
             program,
             source,
+            lane: Arc::default(),
             shell: Arc::default(),
         }
     }
@@ -935,7 +958,69 @@ impl Cli {
             .into_iter()
             .map(|arg| arg.as_ref().to_owned())
             .collect();
-        self.in_shell(args, &mut |_| {}).await
+        if runs_alone(&args) {
+            self.execute_alone(args).await
+        } else {
+            self.in_shell(args, &mut |_| {}).await
+        }
+    }
+
+    /// Runs the command in a CLI of its own.
+    async fn execute_alone(
+        &self,
+        args: Vec<OsString>,
+    ) -> Result<(String, Result<(), Error>), Error> {
+        let mut command = self.command(args);
+        let line = describe(&command);
+
+        // One CLI starts at a time: the lane is held from the spawn until
+        // the CLI has had [`START`] to open its cache, or has finished.
+        let starting = self.lane.lock().await;
+        tracing::debug!(command = %line, "running");
+        let started = Instant::now();
+        let child = command.spawn().inspect_err(|error| {
+            tracing::error!(command = %line, %error, "could not run the CLI");
+        })?;
+        let finishing = child.wait_with_output();
+        tokio::pin!(finishing);
+        let early = tokio::select! {
+            output = &mut finishing => Some(output),
+            () = tokio::time::sleep(START) => None,
+        };
+        drop(starting);
+        let output = match early {
+            Some(output) => output,
+            None => finishing.await,
+        }
+        .inspect_err(|error| {
+            tracing::error!(command = %line, %error, "could not wait for the CLI");
+        })?;
+
+        let elapsed = started.elapsed();
+        let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+
+        if output.status.success() {
+            tracing::info!(command = %line, ?elapsed, bytes = stdout.len(), "done");
+            if !stderr.trim().is_empty() {
+                tracing::debug!(command = %line, stderr = %stderr.trim(), "the CLI said");
+            }
+            Ok((stdout, Ok(())))
+        } else {
+            // What it said on either stream: a runtime's banner of `=`
+            // may land on one and the error on the other.
+            let said = format!("{}\n{}", stderr.trim(), stdout.trim());
+            tracing::warn!(
+                command = %line,
+                ?elapsed,
+                status = %output.status,
+                stderr = %stderr.trim(),
+                stdout = %stdout.trim(),
+                "failed",
+            );
+            let failure = failure(&said, Some(output.status));
+            Ok((stdout, Err(failure)))
+        }
     }
 
     /// Runs the command in the shell, started if it is not up, handing
@@ -1024,8 +1109,10 @@ impl Cli {
         }
     }
 
-    /// Starts the shell and waits for its first prompt.
+    /// Starts the shell and waits for its first prompt, which comes once
+    /// it has started — its cache opened — so the lane is held until then.
     async fn start_shell(&self) -> Result<Shell, Error> {
+        let _starting = self.lane.lock().await;
         tracing::info!(program = %self.program.display(), "starting the CLI's shell");
         let mut child = self
             .command(std::iter::empty::<&str>())
@@ -1056,6 +1143,17 @@ impl Cli {
             }
         }
     }
+}
+
+/// `command` as a shell would show it, for the log.
+fn describe(command: &Command) -> String {
+    let command = command.as_std();
+
+    std::iter::once(command.get_program())
+        .chain(command.get_args())
+        .map(|part| part.to_string_lossy())
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// The versions in what `version` prints, as "CLI 0.8.0, SDK 0.21.0": each
@@ -1723,6 +1821,9 @@ SQLiteError: database is locked\n\
             without_notices("Update recommended: suggested SDK version 1.0\nNode not found: x"),
             "Node not found: x"
         );
+        assert!(runs_alone(&["filesystem", "upload"].map(OsString::from)));
+        assert!(!runs_alone(&["auth", "login"].map(OsString::from)));
+        assert!(!runs_alone(&["filesystem", "list"].map(OsString::from)));
     }
 
     /// The installed CLI's shell, with listings only: run by hand with
