@@ -508,40 +508,23 @@ impl App {
         Adwaita::new(self.scheme, Contrast::Normal, AccentColor::Purple)
     }
 
+    /// What the app listens to: the window's focus and size, the system's
+    /// colour scheme, and the keys no widget took. The events come through
+    /// one subscription, as each one is a channel the runtime feeds every
+    /// event, and four of them filled up on macOS.
     pub fn subscription(&self) -> Subscription<Message> {
         Subscription::batch([
-            window::focus_changes().map(Message::Focused),
-            iced::window::resize_events().map(|_| Message::Resized),
             iced::system::theme_changes().map(Message::SystemScheme),
-            keyboard::listen().filter_map(|event| match event {
-                // `?` is Shift and another key on most layouts, so it is
-                // matched as typed, as GTK's `<Control>question` is.
-                keyboard::Event::KeyPressed {
-                    modified_key: Key::Character(character),
-                    modifiers,
-                    ..
-                } if character == "?" && modifiers.command() => {
-                    Some(Message::ShowDialog(Dialog::Shortcuts))
+            iced::event::listen_with(|event, status, _window| match event {
+                iced::Event::Window(iced::window::Event::Focused) => Some(Message::Focused(true)),
+                iced::Event::Window(iced::window::Event::Unfocused) => {
+                    Some(Message::Focused(false))
                 }
-                keyboard::Event::KeyPressed { key, modifiers, .. } => match key.as_ref() {
-                    Key::Named(Named::Escape) => Some(Message::Escape),
-                    Key::Named(Named::F5) => Some(Message::RefreshTop),
-                    Key::Character("r") if modifiers.command() => Some(Message::RefreshTop),
-                    Key::Character("u") if modifiers.command() => Some(Message::UploadHere),
-                    Key::Character("n") if modifiers.command() => Some(Message::NewFolderHere),
-                    Key::Character("c") if modifiers.command() => Some(Message::CopySelected),
-                    Key::Character("x") if modifiers.command() => Some(Message::CutSelected),
-                    Key::Character("v") if modifiers.command() => Some(Message::PasteHere),
-                    Key::Named(Named::F2) => Some(Message::RenameSelected),
-                    Key::Named(Named::Delete) => Some(Message::DeleteSelected),
-                    Key::Character(",") if modifiers.command() => {
-                        Some(Message::ShowDialog(Dialog::Preferences))
-                    }
-                    Key::Named(Named::ArrowLeft | Named::ArrowUp) if modifiers.alt() => {
-                        Some(Message::Back)
-                    }
-                    _ => None,
-                },
+                iced::Event::Window(iced::window::Event::Resized(_)) => Some(Message::Resized),
+                // A key a widget took — typed into an entry — is its own.
+                iced::Event::Keyboard(event) if status == iced::event::Status::Ignored => {
+                    shortcut(event)
+                }
                 _ => None,
             }),
         ])
@@ -1650,7 +1633,7 @@ impl App {
         adw::window(content)
             .on_window(Message::Window)
             .maximized(self.maximized)
-            .rounded(true)
+            .rounded(ROUNDED_WINDOW)
             .boxed()
     }
 
@@ -3132,6 +3115,44 @@ async fn open(cli: Cli, entry: Entry) -> Result<Opened, drive::Error> {
 }
 
 /// The menu to add to a folder: files from the computer, or a new folder.
+/// Whether the window draws its own rounded corners over a transparent
+/// surface: Linux compositors leave the corners clear, where macOS and
+/// Windows show black, so there the window is square and opaque.
+pub const ROUNDED_WINDOW: bool = cfg!(target_os = "linux");
+
+/// The message a key no widget took stands for, if any.
+fn shortcut(event: keyboard::Event) -> Option<Message> {
+    match event {
+        // `?` is Shift and another key on most layouts, so it is matched
+        // as typed, as GTK's `<Control>question` is.
+        keyboard::Event::KeyPressed {
+            modified_key: Key::Character(character),
+            modifiers,
+            ..
+        } if character == "?" && modifiers.command() => {
+            Some(Message::ShowDialog(Dialog::Shortcuts))
+        }
+        keyboard::Event::KeyPressed { key, modifiers, .. } => match key.as_ref() {
+            Key::Named(Named::Escape) => Some(Message::Escape),
+            Key::Named(Named::F5) => Some(Message::RefreshTop),
+            Key::Character("r") if modifiers.command() => Some(Message::RefreshTop),
+            Key::Character("u") if modifiers.command() => Some(Message::UploadHere),
+            Key::Character("n") if modifiers.command() => Some(Message::NewFolderHere),
+            Key::Character("c") if modifiers.command() => Some(Message::CopySelected),
+            Key::Character("x") if modifiers.command() => Some(Message::CutSelected),
+            Key::Character("v") if modifiers.command() => Some(Message::PasteHere),
+            Key::Named(Named::F2) => Some(Message::RenameSelected),
+            Key::Named(Named::Delete) => Some(Message::DeleteSelected),
+            Key::Character(",") if modifiers.command() => {
+                Some(Message::ShowDialog(Dialog::Preferences))
+            }
+            Key::Named(Named::ArrowLeft | Named::ArrowUp) if modifiers.alt() => Some(Message::Back),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
 fn add_menu(tag: &str) -> Element<'static, Message> {
     menu_button(icon(icons::list_add()))
         .style(adw::button::flat)

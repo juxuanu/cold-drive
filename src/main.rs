@@ -38,7 +38,13 @@ fn main() -> iced::Result {
         .theme(app::App::theme)
         .window_size((960.0, 640.0))
         .decorations(false)
-        .transparent(true)
-        .style(|_, theme| window::style(theme))
+        .transparent(app::ROUNDED_WINDOW)
+        .style(|_, theme| {
+            let mut style = window::style(theme);
+            if !app::ROUNDED_WINDOW {
+                style.background_color = theme.colors().window_bg;
+            }
+            style
+        })
         .run()
 }

@@ -388,6 +388,13 @@ impl Cli {
             .map(|path| std::env::split_paths(&path).collect())
             .unwrap_or_default();
         dirs.extend(dirs::executable_dir());
+        // Where a CLI is put by hand, or by Homebrew, when the app's PATH
+        // is not the shell's — as a macOS app's is not.
+        if cfg!(unix) {
+            dirs.extend(dirs::home_dir().map(|home| home.join(".local/bin")));
+            dirs.push(PathBuf::from("/usr/local/bin"));
+            dirs.push(PathBuf::from("/opt/homebrew/bin"));
+        }
 
         let found = dirs
             .iter()
