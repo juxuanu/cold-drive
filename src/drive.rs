@@ -414,19 +414,19 @@ impl Cli {
     /// Moves `entries` to the trash.
     pub async fn trash(self, entries: Vec<Entry>) -> Result<Done, Error> {
         let paths = entries.iter().map(|entry| entry.path.clone()).collect();
-        self.node_op("trash", paths, None, &entries).await
+        self.node_op("trash", &[], paths, None, &entries).await
     }
 
     /// Restores `entries` from the trash.
     pub async fn restore(self, entries: Vec<Entry>) -> Result<Done, Error> {
         let paths = entries.iter().map(Entry::trash_path).collect();
-        self.node_op("restore", paths, None, &entries).await
+        self.node_op("restore", &[], paths, None, &entries).await
     }
 
     /// Deletes `entries`, which are in the trash, for good.
     pub async fn delete(self, entries: Vec<Entry>) -> Result<Done, Error> {
         let paths = entries.iter().map(Entry::trash_path).collect();
-        self.node_op("delete", paths, None, &entries).await
+        self.node_op("delete", &[], paths, None, &entries).await
     }
 
     /// Copies the entries into the folder at `target`. The CLI copies
@@ -434,13 +434,65 @@ impl Cli {
     /// in the target fails that entry.
     pub async fn copy(self, entries: Vec<Entry>, target: String) -> Result<Done, Error> {
         let paths = entries.iter().map(|entry| entry.path.clone()).collect();
-        self.node_op("copy", paths, Some(target), &entries).await
+        let mut done = self
+            .node_op("copy", &[], paths, Some(target.clone()), &entries)
+            .await?;
+        done.names = entries
+            .iter()
+            .filter(|entry| !done.taken.contains(&entry.uid))
+            .map(|entry| entry.name.clone())
+            .collect();
+
+        // A name taken in the target is what Files meets copying beside
+        // the original, and it names the copy "name (copy)", then
+        // "(copy 2)" and on. The CLI names one node at a time.
+        for uid in std::mem::take(&mut done.taken) {
+            let Some(entry) = entries.iter().find(|entry| entry.uid == uid) else {
+                continue;
+            };
+            done.failed.retain(|(name, _)| *name != entry.name);
+
+            let mut outcome = None;
+            for nth in 1..=COPY_NAMES {
+                let name = copy_name(&entry.name, entry.kind == Kind::Folder, nth);
+                let again = self
+                    .node_op(
+                        "copy",
+                        &["--name", &name],
+                        vec![entry.path.clone()],
+                        Some(target.clone()),
+                        std::slice::from_ref(entry),
+                    )
+                    .await?;
+                if again.taken.is_empty() {
+                    outcome = Some((again, name));
+                    break;
+                }
+            }
+            match outcome {
+                Some((again, name)) => {
+                    if again.failed.is_empty() {
+                        done.names.push(name);
+                    }
+                    done.done += again.done;
+                    done.failed.extend(again.failed);
+                }
+                None => done.failed.push((
+                    entry.name.clone(),
+                    Some(format!(
+                        "the name is taken there, and so are {COPY_NAMES} copies' names"
+                    )),
+                )),
+            }
+        }
+        Ok(done)
     }
 
     /// Moves the entries into the folder at `target`, within the account.
     pub async fn move_to(self, entries: Vec<Entry>, target: String) -> Result<Done, Error> {
         let paths = entries.iter().map(|entry| entry.path.clone()).collect();
-        self.node_op("move", paths, Some(target), &entries).await
+        self.node_op("move", &[], paths, Some(target), &entries)
+            .await
     }
 
     /// Deletes everything in the trash for good. The CLI starts it and
@@ -451,19 +503,20 @@ impl Cli {
             .map(|_| ())
     }
 
-    /// Runs `filesystem <command>` over `paths` — and `target` after them,
-    /// for copy and move — and reads the result it prints for each node,
-    /// named after `entries`.
+    /// Runs `filesystem <command> <options>` over `paths` — and `target`
+    /// after them, for copy and move — and reads the result it prints for
+    /// each node, named after `entries`.
     async fn node_op(
         &self,
         command: &str,
+        options: &[&str],
         paths: Vec<String>,
         target: Option<String>,
         entries: &[Entry],
     ) -> Result<Done, Error> {
-        let mut args: Vec<OsString> = ["filesystem", command, "--json", "--"]
-            .map(OsString::from)
-            .into();
+        let mut args: Vec<OsString> = ["filesystem", command, "--json"].map(OsString::from).into();
+        args.extend(options.iter().map(OsString::from));
+        args.push(OsString::from("--"));
         args.extend(paths.into_iter().map(OsString::from));
         args.extend(target.map(OsString::from));
 
@@ -481,10 +534,14 @@ impl Cli {
             if result.ok {
                 done.done += 1;
             } else {
-                let reason = result
-                    .error
-                    .as_ref()
-                    .and_then(|error| error.get("message")?.as_str().map(str::to_owned));
+                let error = result.error.as_ref();
+                let name = error.and_then(|error| error.get("name")?.as_str());
+                if name == Some(NAME_TAKEN) {
+                    done.taken.push(result.uid.clone());
+                }
+                let reason = error
+                    .and_then(|error| error.get("message")?.as_str().map(str::to_owned))
+                    .or_else(|| name.map(reason_for));
                 done.failed.push((name_of(&result.uid), reason));
             }
         }
@@ -933,6 +990,52 @@ fn parse_sharing(stdout: &str) -> Result<Option<Sharing>, Error> {
 pub struct Done {
     pub done: usize,
     pub failed: Vec<(String, Option<String>)>,
+    /// The nodes whose name was already taken in the target, by UID —
+    /// also among `failed`.
+    pub taken: Vec<String>,
+    /// What a copy made, by name: the originals', or the "(copy)" names.
+    pub names: Vec<String>,
+}
+
+/// The SDK's error for a name already in the target folder.
+const NAME_TAKEN: &str = "NodeWithSameNameExistsValidationError";
+
+/// How many "(copy)" names are tried before a copy gives up.
+const COPY_NAMES: u32 = 9;
+
+/// A reason from the SDK's error name, which is all its validation errors
+/// carry: "NodeWithSameNameExistsValidationError" is "the name is already
+/// taken there", and an unknown "SomethingWentWrongError" is "something
+/// went wrong".
+fn reason_for(name: &str) -> String {
+    if name == NAME_TAKEN {
+        return "the name is already taken there".to_owned();
+    }
+    let name = name
+        .strip_suffix("ValidationError")
+        .or_else(|| name.strip_suffix("Error"))
+        .unwrap_or(name);
+    let mut words = String::new();
+    for (at, character) in name.char_indices() {
+        if character.is_uppercase() && at > 0 {
+            words.push(' ');
+        }
+        words.extend(character.to_lowercase());
+    }
+    words
+}
+
+/// Files' name for the `nth` copy beside the original: "Notes (copy).md",
+/// then "Notes (copy 2).md". A folder's name has no extension to keep.
+fn copy_name(name: &str, folder: bool, nth: u32) -> String {
+    let (stem, extension) = match name.rsplit_once('.') {
+        Some((stem, extension)) if !folder && !stem.is_empty() => (stem, format!(".{extension}")),
+        _ => (name, String::new()),
+    };
+    match nth {
+        1 => format!("{stem} (copy){extension}"),
+        nth => format!("{stem} (copy {nth}){extension}"),
+    }
 }
 
 /// What `trash`, `restore` and `delete` print for each node.
@@ -1270,6 +1373,26 @@ fn is_node_uid(uid: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reasons_come_from_error_names() {
+        assert_eq!(reason_for(NAME_TAKEN), "the name is already taken there");
+        assert_eq!(reason_for("InvalidNameValidationError"), "invalid name");
+        assert_eq!(reason_for("RateLimitedError"), "rate limited");
+        assert_eq!(reason_for("Oops"), "oops");
+    }
+
+    #[test]
+    fn copies_are_named_as_files_names_them() {
+        assert_eq!(copy_name("Notes.md", false, 1), "Notes (copy).md");
+        assert_eq!(copy_name("Notes.md", false, 2), "Notes (copy 2).md");
+        assert_eq!(
+            copy_name("archive.tar.gz", false, 1),
+            "archive.tar (copy).gz"
+        );
+        assert_eq!(copy_name(".bashrc", false, 1), ".bashrc (copy)");
+        assert_eq!(copy_name("Photos.2024", true, 1), "Photos.2024 (copy)");
+    }
 
     const UID: &str = "AAAAAAAAAAAAAAAAAAAAAA~BBBBBBBBBBBBBBBBBBBBBB";
 

@@ -1146,6 +1146,12 @@ impl App {
                         if cut {
                             self.clipboard = None;
                         }
+                        // A copy may have been named "(copy)" on the way.
+                        let names = if done.names.is_empty() {
+                            names
+                        } else {
+                            done.names
+                        };
                         if let Some(folder) = self.folder_mut(&tag) {
                             folder.select_next = names;
                         }
