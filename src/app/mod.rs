@@ -104,6 +104,9 @@ struct Clipboard {
     cut: bool,
     /// The folder they are in, for the operation's details.
     from: String,
+    /// Whether the banner says so: until something is pasted, or it is
+    /// dismissed. Paste still works after.
+    shown: bool,
 }
 
 /// The item the Info dialog is about.
@@ -344,6 +347,8 @@ pub enum Message {
     Pasted(u64, String, Vec<String>, bool, Result<Done, drive::Error>),
     /// Select every row shown on the page.
     SelectAll(String),
+    /// Close the banner saying what was taken; the clipboard keeps it.
+    DismissTaken,
     /// Open the Share dialog on the item.
     ShareIn(String, String),
     /// Leave the item shared with the account.
@@ -1152,6 +1157,10 @@ impl App {
                         if cut {
                             self.clipboard = None;
                         }
+                        // The banner has had its paste.
+                        if let Some(clipboard) = &mut self.clipboard {
+                            clipboard.shown = false;
+                        }
                         // A copy may have been named "(copy)" on the way.
                         let names = if done.names.is_empty() {
                             names
@@ -1167,6 +1176,11 @@ impl App {
                     Err(error) => self.toast(format!("Could not {verb}: {error}")),
                 }
                 return self.load(&tag);
+            }
+            Message::DismissTaken => {
+                if let Some(clipboard) = &mut self.clipboard {
+                    clipboard.shown = false;
+                }
             }
             Message::SelectAll(tag) => {
                 if let Some(folder) = self.folder_mut(&tag) {
@@ -1899,7 +1913,12 @@ impl App {
         };
 
         tracing::info!(count = entries.len(), cut, "taken for pasting");
-        self.clipboard = Some(Clipboard { entries, cut, from });
+        self.clipboard = Some(Clipboard {
+            entries,
+            cut,
+            from,
+            shown: true,
+        });
     }
 
     /// Paste: the clipboard's items are copied, or moved, into the folder
@@ -1909,7 +1928,10 @@ impl App {
         let Some(cli) = self.cli.clone() else {
             return Task::none();
         };
-        let Some(Clipboard { entries, cut, from }) = self.clipboard.clone() else {
+        let Some(Clipboard {
+            entries, cut, from, ..
+        }) = self.clipboard.clone()
+        else {
             return Task::none();
         };
         let names: Vec<String> = if select {
@@ -2422,23 +2444,14 @@ impl App {
                         .clipboard
                         .as_ref()
                         .map(|_| Message::Paste(page.tag.clone()));
-                    // And over it, while something is taken, a banner
-                    // saying so with Paste Here: the way to paste without
-                    // a key or a menu.
-                    let taken = self.clipboard.as_ref().map(|clipboard| {
-                        let what = describe(&clipboard.entries);
-                        if clipboard.cut {
-                            format!("{what} cut")
-                        } else {
-                            format!("{what} copied")
-                        }
-                    });
-                    let paste_bar = adw::banner(taken.clone().unwrap_or_default())
-                        .button("Paste Here", Message::Paste(page.tag.clone()))
-                        .surface(Surface::View)
-                        .backdrop(backdrop)
-                        .revealed(taken.is_some())
-                        .boxed();
+                    // And over it, once something is taken and until it
+                    // is pasted, a banner saying so with Paste Here — the
+                    // way to paste without a key or a menu — and a close.
+                    let paste_bar = taken_banner(
+                        self.clipboard.as_ref().filter(|clipboard| clipboard.shown),
+                        Message::Paste(page.tag.clone()),
+                        backdrop,
+                    );
                     let menu = adw::context_menu(container(view))
                         .push(
                             item("New Folder…")
@@ -3119,6 +3132,49 @@ fn failed(verb: &str, where_to: &str, done: &Done) -> String {
         [(name, None)] => format!("Could not {verb} “{name}”{to}"),
         failed => format!("Could not {verb} {} items{to}", failed.len()),
     }
+}
+
+/// A banner saying what was taken — "“Notes.md” copied", "3 items cut" —
+/// with Paste Here and a close, laid out and tinted as `AdwBanner` is;
+/// `AdwBanner` has no close, so this is composed. Slid away with `None`.
+fn taken_banner<'a>(
+    clipboard: Option<&Clipboard>,
+    on_paste: Message,
+    backdrop: bool,
+) -> Element<'a, Message> {
+    use libadwaita_iced::widget::banner;
+    use libadwaita_iced::widget::revealer::{Transition, revealer};
+
+    let title = clipboard.map_or_else(String::new, |clipboard| {
+        let what = describe(&clipboard.entries);
+        if clipboard.cut {
+            format!("{what} cut")
+        } else {
+            format!("{what} copied")
+        }
+    });
+    let bar = row![
+        typography::heading(title).center().width(Fill),
+        adw::text_button("Paste Here").on_press(on_paste),
+        adw::circular_button(icons::window_close())
+            .style(adw::button::flat)
+            .on_press(Message::DismissTaken),
+    ]
+    .spacing(6)
+    .align_y(Alignment::Center);
+
+    revealer(
+        container(bar)
+            .padding(6)
+            .width(Fill)
+            .style(move |theme: &Adwaita| iced::widget::container::Style {
+                background: Some(banner::background(theme, Surface::View, backdrop).into()),
+                ..Default::default()
+            }),
+    )
+    .revealed(clipboard.is_some())
+    .transition(Transition::SlideDown)
+    .boxed()
 }
 
 /// The id of a folder page's list or grid, to scroll it by.
