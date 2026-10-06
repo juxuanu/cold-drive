@@ -301,7 +301,8 @@ impl App {
                         .into()
                 });
                 if let Some(public) = public {
-                    let copy = adw::icon_button(self.copy_icon("Link"))
+                    let copy = adw::button(self.copy_icon("Link"))
+                        .image_button()
                         .style(adw::button::flat)
                         .on_press(Message::CopyText(public.url.clone(), "Link"));
                     let mut about = vec![format!("{} downloads", public.downloads)];

@@ -1865,14 +1865,13 @@ impl App {
         self.operations.retain(|operation| operation.id != id);
     }
 
-    /// A copy button's icon: a check mark for the second after it copied
-    /// `what`, the copy icon otherwise.
-    pub(super) fn copy_icon(&self, what: &'static str) -> icon::Handle {
-        if self.copied == Some(what) {
-            icons::object_select()
-        } else {
-            icons::edit_copy()
-        }
+    /// A copy button's icon: the copy icon, cross-faded to a check mark
+    /// for the second after it copied `what`, and back.
+    pub(super) fn copy_icon(&self, what: &'static str) -> impl Widget<Message> + 'static {
+        adw::view_stack(usize::from(self.copied == Some(what)))
+            .push(icon(icons::edit_copy()))
+            .push(icon(icons::object_select()))
+            .enable_transitions(true)
     }
 
     fn toast(&mut self, title: String) {
@@ -3052,8 +3051,16 @@ impl App {
                 row![
                     adw::icon_text_button(icons::adw_external_link(), "Open Browser")
                         .on_press(Message::OpenExternally(url.clone())),
-                    adw::icon_text_button(self.copy_icon("Sign-in link"), "Copy Link")
-                        .on_press(Message::CopyText(url.clone(), "Sign-in link")),
+                    adw::button(
+                        row![
+                            self.copy_icon("Sign-in link"),
+                            typography::heading("Copy Link")
+                        ]
+                        .spacing(6)
+                        .align_y(Alignment::Center),
+                    )
+                    .icon_text_button()
+                    .on_press(Message::CopyText(url.clone(), "Sign-in link")),
                 ]
                 .spacing(12)
                 .boxed(),
