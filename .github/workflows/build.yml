@@ -40,3 +40,38 @@ jobs:
           name: cold-drive-${{ matrix.name }}
           path: target/release/${{ matrix.bin }}
           if-no-files-found: error
+
+  publish:
+    name: Latest build
+    needs: build
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      - name: Name the binaries after their platform
+        run: |
+          mkdir -p latest
+          cp artifacts/cold-drive-linux-x86_64/cold-drive latest/cold-drive-linux-x86_64
+          cp artifacts/cold-drive-macos-arm64/cold-drive latest/cold-drive-macos-arm64
+          cp artifacts/cold-drive-windows-x86_64/cold-drive.exe latest/cold-drive-windows-x86_64.exe
+          ls -l latest
+      # The `latest` tag follows main, so the release's download links
+      # stay the same while what they fetch is the newest build.
+      - name: Move the latest tag here
+        run: |
+          git tag -f latest
+          git push -f origin latest
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: latest
+          name: Latest build
+          prerelease: true
+          body: |
+            Built from `main` at ${{ github.sha }} by the Build workflow.
+            Pick the binary for your platform; see the README for the Proton Drive CLI it needs.
+          files: latest/*
