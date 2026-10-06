@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 
 use iced::futures::{SinkExt, Stream};
 use serde::Deserialize;
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command};
 
 /// Overrides where the CLI is looked for.
@@ -26,19 +26,32 @@ const CLI_NAMES: &[&str] = &["proton-drive", "proton-drive-cli"];
 /// What the CLI prints, on stderr, for a command that needs a session.
 const AUTH_REQUIRED: &str = "You need to login first";
 
-/// How long a CLI is given to start before the next one may: it opens
-/// its SQLite cache as it starts, and two opening it together fail with
-/// `SQLITE_BUSY_RECOVERY`, "database is locked", before either has done
-/// anything. Starting takes under half a second; what runs after — a
-/// listing, a transfer — shares the cache fine, so only the starts queue.
-const START: Duration = Duration::from_secs(1);
+/// What the CLI writes to stderr without failing: a notice, once per
+/// process, that a newer version is wanted.
+const NOTICES: [&str; 3] = ["Update needed:", "Update required:", "Update recommended:"];
+
+/// The CLI's stderr with its notices logged and taken out: what is left
+/// is the message of a command that failed.
+fn without_notices(stderr: &str) -> String {
+    stderr
+        .lines()
+        .filter(|line| {
+            let notice = NOTICES
+                .iter()
+                .any(|notice| line.trim_start().starts_with(notice));
+            if notice {
+                tracing::warn!(notice = %line.trim(), "the CLI says");
+            }
+            !notice
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
 
 #[derive(Debug, Clone)]
 pub struct Cli {
     program: PathBuf,
     source: Source,
-    /// Held while a CLI starts: see [`START`].
-    lane: Arc<tokio::sync::Mutex<()>>,
     /// The CLI's own shell, kept running for the commands that are quick:
     /// one start, one cache opened. See [`Shell`].
     shell: Arc<tokio::sync::Mutex<Shells>>,
@@ -84,11 +97,11 @@ impl Shells {
 
 /// `proton-drive` with no arguments: its interactive shell, which takes
 /// the same commands as its arguments, one per line at its prompt, and
-/// runs them in the one process. A command's output comes on stdout and
-/// then the prompt again; a failure's message comes on stderr, one line,
-/// and the prompt again. Transfers and signing in are not run here: they
-/// run long, or need the pipes themselves, and a one-shot CLI is killed
-/// to cancel them.
+/// runs them in the one process — the only way the CLI is run. A
+/// command's output comes on stdout and then the prompt again; a
+/// failure's message comes on stderr, one line, and the prompt again.
+/// Commands run one at a time, a transfer included; a command dropped
+/// mid-way — cancelled — kills the shell, and the next starts another.
 struct Shell {
     child: Child,
     stdin: ChildStdin,
@@ -115,12 +128,17 @@ enum Outcome {
 }
 
 impl Shell {
-    /// Reads until the prompt is back, or the shell has ended.
-    async fn until_prompt(&mut self) -> Result<Outcome, Error> {
+    /// Reads until the prompt is back, or the shell has ended, handing
+    /// each complete line of stdout to `on_line` as it arrives.
+    async fn until_prompt(
+        &mut self,
+        on_line: &mut (dyn FnMut(&str) + Send),
+    ) -> Result<Outcome, Error> {
         let mut out = Vec::new();
         let mut err = Vec::new();
         let mut chunk = [0u8; 8192];
         let mut err_chunk = [0u8; 8192];
+        let mut lined = 0;
 
         loop {
             tokio::select! {
@@ -133,6 +151,10 @@ impl Shell {
                         return Ok(Outcome::Ended { out, err });
                     }
                     out.extend_from_slice(&chunk[..read]);
+                    while let Some(end) = out[lined..].iter().position(|&byte| byte == b'\n') {
+                        on_line(&String::from_utf8_lossy(&out[lined..lined + end]));
+                        lined += end + 1;
+                    }
                     if out.ends_with(PROMPT) {
                         out.truncate(out.len() - PROMPT.len());
                         // The error was written before the prompt was, on
@@ -186,11 +208,15 @@ impl Drop for Flight<'_> {
 }
 
 /// Sends the line to the shell and reads how it ends.
-async fn drive(shell: &mut Shell, line: &str) -> Result<Outcome, Error> {
+async fn drive(
+    shell: &mut Shell,
+    line: &str,
+    on_line: &mut (dyn FnMut(&str) + Send),
+) -> Result<Outcome, Error> {
     shell.stdin.write_all(line.as_bytes()).await?;
     shell.stdin.write_all(b"\n").await?;
     shell.stdin.flush().await?;
-    shell.until_prompt().await
+    shell.until_prompt(on_line).await
 }
 
 /// A command as a line for the shell: every argument in double quotes,
@@ -215,19 +241,6 @@ fn quote_line(args: &[OsString]) -> String {
         })
         .collect::<Vec<_>>()
         .join(" ")
-}
-
-/// Whether a command runs in a CLI of its own rather than the shell: the
-/// transfers, which run long and are killed to cancel, and signing in
-/// and out, which the shell's own session would not follow.
-fn runs_alone(args: &[OsString]) -> bool {
-    matches!(
-        (
-            args.first().and_then(|a| a.to_str()),
-            args.get(1).and_then(|a| a.to_str()),
-        ),
-        (Some("auth"), _) | (Some("filesystem"), Some("upload" | "download"))
-    )
 }
 
 impl Cli {
@@ -371,7 +384,6 @@ impl Cli {
         Self {
             program,
             source,
-            lane: Arc::default(),
             shell: Arc::default(),
         }
     }
@@ -852,57 +864,38 @@ impl Cli {
 
     /// Runs `auth login`: the sign-in page's address as soon as the CLI has
     /// it, then the outcome once the browser has finished. Dropping the
-    /// stream kills the CLI.
+    /// stream kills the shell, and the sign-in with it.
     pub fn login(self) -> impl Stream<Item = Login> {
         iced::stream::channel(4, async move |mut output| {
             tracing::info!(program = %self.program.display(), "signing in");
-            let result = async {
-                let mut child = self
-                    .command(["auth", "login", "--json"])
-                    .stdout(Stdio::piped())
-                    .stderr(Stdio::piped())
-                    .spawn()?;
 
-                let stdout = child
-                    .stdout
-                    .take()
-                    .ok_or_else(|| Error::Io("no stdout".into()))?;
-                let mut stderr = child
-                    .stderr
-                    .take()
-                    .ok_or_else(|| Error::Io("no stderr".into()))?;
-                let mut lines = BufReader::new(stdout).lines();
-
-                while let Some(line) = lines.next_line().await? {
-                    #[derive(Deserialize)]
-                    #[serde(rename_all = "camelCase")]
-                    struct SignIn {
-                        sign_in_url: String,
-                    }
-
-                    if let Ok(SignIn { sign_in_url }) = serde_json::from_str(line.trim()) {
-                        // The address carries a one-off sign-in token, so
-                        // it is not logged.
-                        tracing::info!("sign-in page ready");
-                        let _ = output.send(Login::Url(sign_in_url)).await;
-                    }
-                }
-
-                let mut errors = String::new();
-                stderr.read_to_string(&mut errors).await?;
-                let status = child.wait().await?;
-                if status.success() {
-                    Ok(())
-                } else {
-                    Err(failure(&errors, Some(status)))
-                }
+            #[derive(Deserialize)]
+            #[serde(rename_all = "camelCase")]
+            struct SignIn {
+                sign_in_url: String,
             }
-            .await;
+            let mut urls = output.clone();
+            let mut on_line = |line: &str| {
+                if let Ok(SignIn { sign_in_url }) = serde_json::from_str::<SignIn>(line.trim()) {
+                    // The address carries a one-off sign-in token, so it
+                    // is not logged.
+                    tracing::info!("sign-in page ready");
+                    let _ = urls.try_send(Login::Url(sign_in_url));
+                }
+            };
+            let result = self
+                .in_shell(
+                    ["auth", "login", "--json"].map(OsString::from).into(),
+                    &mut on_line,
+                )
+                .await
+                .and_then(|(_, outcome)| outcome);
 
             match &result {
                 Ok(()) => {
                     tracing::info!("signed in");
-                    // The shell's session, if one is up, is the old one.
+                    // The shell's session is the one from before: the next
+                    // command starts one that is signed in.
                     self.shell.lock().await.shell.take();
                 }
                 Err(error) => tracing::warn!(%error, "sign-in failed"),
@@ -942,38 +935,38 @@ impl Cli {
             .into_iter()
             .map(|arg| arg.as_ref().to_owned())
             .collect();
-        if runs_alone(&args) {
-            self.execute_alone(args).await
-        } else {
-            self.in_shell(args).await
-        }
+        self.in_shell(args, &mut |_| {}).await
     }
 
-    /// Runs the command in the shell, started if it is not up — or in a
-    /// CLI of its own while the shell is left alone, or will not start.
-    async fn in_shell(&self, args: Vec<OsString>) -> Result<(String, Result<(), Error>), Error> {
+    /// Runs the command in the shell, started if it is not up, handing
+    /// each line it prints to `on_line` as it comes: what it printed, and
+    /// how it ended.
+    async fn in_shell(
+        &self,
+        args: Vec<OsString>,
+        on_line: &mut (dyn FnMut(&str) + Send),
+    ) -> Result<(String, Result<(), Error>), Error> {
         let line = quote_line(&args);
         let mut guard = self.shell.lock().await;
         let shells = &mut *guard;
 
         if shells.resting() {
-            tracing::debug!(command = %line, "the shell is resting; running alone");
-            drop(guard);
-            return self.execute_alone(args).await;
+            tracing::warn!(command = %line, "the CLI's shell keeps ending; not started again yet");
+            return Err(Error::Failed(
+                "The CLI keeps ending; it is given a minute before it is started again".to_owned(),
+            ));
         }
         if shells.shell.is_none() {
             match self.start_shell().await {
                 Ok(shell) => shells.shell = Some(shell),
                 Err(error) => {
-                    tracing::warn!(%error, "the CLI's shell did not start; running alone");
                     shells.ended();
-                    drop(guard);
-                    return self.execute_alone(args).await;
+                    return Err(error);
                 }
             }
         }
 
-        tracing::debug!(command = %line, "running in the shell");
+        tracing::debug!(command = %line, "running");
         let started = Instant::now();
         let outcome = {
             let mut flight = Flight {
@@ -981,7 +974,7 @@ impl Cli {
                 done: false,
             };
             let outcome = match flight.shell.as_mut() {
-                Some(shell) => drive(shell, &line).await,
+                Some(shell) => drive(shell, &line, on_line).await,
                 None => Err(Error::Io("the shell is gone".into())),
             };
             // A pipe that failed leaves the shell unusable: the flight
@@ -1014,7 +1007,7 @@ impl Cli {
         let ended = status.is_some();
 
         let stdout = String::from_utf8_lossy(&out).into_owned();
-        let stderr = String::from_utf8_lossy(&err);
+        let stderr = without_notices(&String::from_utf8_lossy(&err));
         if !ended && stderr.trim().is_empty() {
             tracing::info!(command = %line, ?elapsed, bytes = stdout.len(), "done");
             Ok((stdout, Ok(())))
@@ -1031,10 +1024,8 @@ impl Cli {
         }
     }
 
-    /// Starts the shell and waits for its first prompt, which comes once
-    /// it has started — its cache opened — so the lane is held until then.
+    /// Starts the shell and waits for its first prompt.
     async fn start_shell(&self) -> Result<Shell, Error> {
-        let _starting = self.lane.lock().await;
         tracing::info!(program = %self.program.display(), "starting the CLI's shell");
         let mut child = self
             .command(std::iter::empty::<&str>())
@@ -1051,7 +1042,7 @@ impl Cli {
             stderr_open: true,
             child,
         };
-        match shell.until_prompt().await? {
+        match shell.until_prompt(&mut |_| {}).await? {
             Outcome::Prompt { .. } => Ok(shell),
             Outcome::Ended { out, err } => {
                 let status = shell.child.wait().await?;
@@ -1063,64 +1054,6 @@ impl Cli {
                 tracing::warn!(%status, said = %said.trim(), "the CLI's shell did not start");
                 Err(failure(&said, Some(status)))
             }
-        }
-    }
-
-    /// Runs the command in a CLI of its own.
-    async fn execute_alone(
-        &self,
-        args: Vec<OsString>,
-    ) -> Result<(String, Result<(), Error>), Error> {
-        let mut command = self.command(args);
-        let line = describe(&command);
-
-        // One CLI starts at a time: the lane is held from the spawn until
-        // the CLI has had [`START`] to open its cache, or has finished.
-        let starting = self.lane.lock().await;
-        tracing::debug!(command = %line, "running");
-        let started = Instant::now();
-        let child = command.spawn().inspect_err(|error| {
-            tracing::error!(command = %line, %error, "could not run the CLI");
-        })?;
-        let finishing = child.wait_with_output();
-        tokio::pin!(finishing);
-        let early = tokio::select! {
-            output = &mut finishing => Some(output),
-            () = tokio::time::sleep(START) => None,
-        };
-        drop(starting);
-        let output = match early {
-            Some(output) => output,
-            None => finishing.await,
-        }
-        .inspect_err(|error| {
-            tracing::error!(command = %line, %error, "could not wait for the CLI");
-        })?;
-
-        let elapsed = started.elapsed();
-        let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
-        let stderr = String::from_utf8_lossy(&output.stderr);
-
-        if output.status.success() {
-            tracing::info!(command = %line, ?elapsed, bytes = stdout.len(), "done");
-            if !stderr.trim().is_empty() {
-                tracing::debug!(command = %line, stderr = %stderr.trim(), "the CLI said");
-            }
-            Ok((stdout, Ok(())))
-        } else {
-            // What it said on either stream: a runtime's banner of `=`
-            // may land on one and the error on the other.
-            let said = format!("{}\n{}", stderr.trim(), stdout.trim());
-            tracing::warn!(
-                command = %line,
-                ?elapsed,
-                status = %output.status,
-                stderr = %stderr.trim(),
-                stdout = %stdout.trim(),
-                "failed",
-            );
-            let failure = failure(&said, Some(output.status));
-            Ok((stdout, Err(failure)))
         }
     }
 }
@@ -1143,17 +1076,6 @@ fn versions(stdout: &str) -> Option<String> {
         .collect();
 
     (!versions.is_empty()).then(|| versions.join(", "))
-}
-
-/// `command` as a shell would show it, for the log.
-fn describe(command: &Command) -> String {
-    let command = command.as_std();
-
-    std::iter::once(command.get_program())
-        .chain(command.get_args())
-        .map(|part| part.to_string_lossy())
-        .collect::<Vec<_>>()
-        .join(" ")
 }
 
 /// `name` as an executable file is named on this platform.
@@ -1797,9 +1719,10 @@ SQLiteError: database is locked\n\
             quote_line(&args),
             r#""filesystem" "rename" "--" "/my-files/a b" "quo\"te\\back line""#
         );
-        assert!(runs_alone(&["filesystem", "upload"].map(OsString::from)));
-        assert!(runs_alone(&["auth", "login"].map(OsString::from)));
-        assert!(!runs_alone(&["filesystem", "list"].map(OsString::from)));
+        assert_eq!(
+            without_notices("Update recommended: suggested SDK version 1.0\nNode not found: x"),
+            "Node not found: x"
+        );
     }
 
     /// The installed CLI's shell, with listings only: run by hand with
