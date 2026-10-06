@@ -3382,11 +3382,10 @@ mod tests {
         assert!(second_click_opens(Duration::ZERO));
     }
 
-    /// The same with the pointer resting on the row first. The list
-    /// stamps a press with the time of the last frame, not its own, so
-    /// this needs a third click: reported upstream, with a reproducer.
+    /// The same with the pointer resting on the row first: the list once
+    /// stamped a press with the time of the last frame, not its own, and
+    /// this needed a third click.
     #[test]
-    #[ignore = "libadwaita-iced: list_view stamps a press with the last frame's time"]
     fn a_second_click_opens_the_folder_after_the_pointer_rested() {
         assert!(second_click_opens(
             list_view::DOUBLE_CLICK + Duration::from_millis(100)
